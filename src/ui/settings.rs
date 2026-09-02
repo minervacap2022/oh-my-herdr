@@ -15,18 +15,28 @@ use crate::{
     config::{StatusIndicatorStyle, ToastDelivery},
 };
 
-pub(crate) const SETTINGS_POPUP_WIDTH: u16 = 76;
+pub(crate) const SETTINGS_POPUP_WIDTH: u16 = 84;
 pub(crate) const SETTINGS_POPUP_BASE_HEIGHT: u16 = 22;
 
 pub(crate) fn settings_popup_height(app: &AppState) -> u16 {
-    if app.settings.section != crate::app::state::SettingsSection::Integrations {
-        return SETTINGS_POPUP_BASE_HEIGHT;
+    match app.settings.section {
+        crate::app::state::SettingsSection::Agents => {
+            let rows = if app.settings.agent_profile_form.is_some() {
+                7
+            } else {
+                3 + app.saved_agent_profiles.len() as u16
+            };
+            (14 + rows).max(SETTINGS_POPUP_BASE_HEIGHT)
+        }
+        crate::app::state::SettingsSection::Integrations => {
+            let list_rows = app.integration_recommendations.len().max(1) as u16;
+            let footer_rows = integrations_footer_height(app, SETTINGS_POPUP_WIDTH - 2);
+            // borders 2 + header 3 + stack gaps 2 + modal footer 2
+            // + section title 1 + description 2 + spacers 2
+            (14 + list_rows + footer_rows).max(SETTINGS_POPUP_BASE_HEIGHT)
+        }
+        _ => SETTINGS_POPUP_BASE_HEIGHT,
     }
-    let list_rows = app.integration_recommendations.len().max(1) as u16;
-    let footer_rows = integrations_footer_height(app, SETTINGS_POPUP_WIDTH - 2);
-    // borders 2 + header 3 + stack gaps 2 + modal footer 2
-    // + section title 1 + description 2 + spacers 2
-    (14 + list_rows + footer_rows).max(SETTINGS_POPUP_BASE_HEIGHT)
 }
 
 pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -162,6 +172,7 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
                 app.settings.list.selected,
             );
         }
+        SettingsSection::Agents => render_settings_agents(app, frame, content_area),
         SettingsSection::Integrations => {
             render_settings_integrations(app, frame, content_area);
         }
@@ -197,13 +208,16 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
                 .add_modifier(Modifier::BOLD),
         );
 
+        let footer_hint = if app.settings.agent_profile_form.is_some() {
+            " ↑↓ select field  ←→ harness  ↵ save"
+        } else {
+            " ↑↓ select  tab section"
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" ↑↓", Style::default().fg(p.overlay0)),
-                Span::styled(" select  ", Style::default().fg(p.overlay1)),
-                Span::styled("tab", Style::default().fg(p.overlay0)),
-                Span::styled(" section", Style::default().fg(p.overlay1)),
-            ])),
+            Paragraph::new(Line::from(vec![Span::styled(
+                footer_hint,
+                Style::default().fg(p.overlay1),
+            )])),
             footer_rows[0],
         );
     }
@@ -214,6 +228,7 @@ pub(crate) fn settings_primary_button_label(
 ) -> &'static str {
     match section {
         crate::app::state::SettingsSection::Integrations => "install",
+        crate::app::state::SettingsSection::Agents => "save",
         _ => "apply",
     }
 }
@@ -224,6 +239,7 @@ pub(crate) fn settings_show_primary_action(app: &AppState) -> bool {
             .integration_recommendations
             .iter()
             .any(crate::integration::IntegrationRecommendation::needs_install),
+        crate::app::state::SettingsSection::Agents => app.settings.agent_profile_form.is_some(),
         _ => true,
     }
 }
@@ -370,6 +386,164 @@ fn render_settings_integrations(app: &AppState, frame: &mut Frame, area: Rect) {
     frame.render_widget(footer, rows[5]);
 }
 
+fn render_settings_agents(app: &AppState, frame: &mut Frame, area: Rect) {
+    let p = &app.palette;
+    if let Some(form) = &app.settings.agent_profile_form {
+        render_agent_profile_form(form, frame, area, p);
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas::<4>(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "saved agents",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "enter starts a saved profile • e edits its harness and working directory",
+            Style::default().fg(p.overlay1),
+        ))),
+        rows[1],
+    );
+
+    let mut entries = vec![
+        ListItem::new(Line::from(Span::styled(
+            " + create Codex agent",
+            Style::default().fg(p.accent),
+        ))),
+        ListItem::new(Line::from(Span::styled(
+            " + create Pi agent",
+            Style::default().fg(p.accent),
+        ))),
+        ListItem::new(Line::from(Span::styled(
+            " + create Claude agent",
+            Style::default().fg(p.accent),
+        ))),
+    ];
+    entries.extend(app.saved_agent_profiles.iter().map(|profile| {
+        ListItem::new(Line::from(vec![
+            Span::styled(" ▶ ", Style::default().fg(p.green)),
+            Span::styled(&profile.role, Style::default().fg(p.text)),
+            Span::styled(
+                format!("  {}", profile.harness),
+                Style::default().fg(p.overlay1),
+            ),
+        ]))
+    }));
+
+    let list = List::new(entries)
+        .highlight_style(
+            Style::default()
+                .bg(p.surface0)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(" ▸ ");
+    let mut state = ListState::default().with_selected(Some(app.settings.list.selected));
+    frame.render_stateful_widget(list, rows[3], &mut state);
+}
+
+fn render_agent_profile_form(
+    form: &crate::app::state::AgentProfileForm,
+    frame: &mut Frame,
+    area: Rect,
+    p: &Palette,
+) {
+    let title = if form.is_new() {
+        "new agent profile"
+    } else {
+        "edit agent profile"
+    };
+    let description = if form.is_new() {
+        "choose a role, working directory, and initial profile instructions"
+    } else {
+        "change the native harness or working directory for this saved agent"
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(description, Style::default().fg(p.overlay1))),
+        Line::from(""),
+    ];
+
+    if form.is_new() {
+        lines.push(agent_profile_form_line(
+            "role",
+            &form.role,
+            form.selected_field == 0,
+            p,
+        ));
+        lines.push(agent_profile_form_line(
+            "native harness",
+            &format!("{}  (←→ to change)", form.harness),
+            form.selected_field == 1,
+            p,
+        ));
+        lines.push(agent_profile_form_line(
+            "native cwd",
+            &form.native_cwd,
+            form.selected_field == 2,
+            p,
+        ));
+        lines.push(agent_profile_form_line(
+            "AGENTS.md",
+            &form.instructions,
+            form.selected_field == 3,
+            p,
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" role: ", Style::default().fg(p.overlay1)),
+            Span::styled(&form.role, Style::default().fg(p.text)),
+        ]));
+        lines.push(agent_profile_form_line(
+            "native harness",
+            &format!("{}  (←→ to change)", form.harness),
+            form.selected_field == 0,
+            p,
+        ));
+        lines.push(agent_profile_form_line(
+            "native cwd",
+            &form.native_cwd,
+            form.selected_field == 1,
+            p,
+        ));
+        lines.push(Line::from(Span::styled(
+            " profile-owned AGENTS.md stays attached when these settings change",
+            Style::default().fg(p.overlay1),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " enter saves • esc cancels",
+        Style::default().fg(p.overlay0),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn agent_profile_form_line(label: &str, value: &str, selected: bool, p: &Palette) -> Line<'static> {
+    let style = if selected {
+        Style::default().fg(p.text).bg(p.surface0)
+    } else {
+        Style::default().fg(p.subtext0)
+    };
+    Line::from(vec![
+        Span::styled(format!(" {}: ", label), style),
+        Span::styled(value.to_string(), style),
+    ])
+}
+
 fn render_settings_theme(app: &AppState, frame: &mut Frame, area: Rect) {
     use crate::app::state::THEME_NAMES;
 
@@ -421,4 +595,86 @@ fn render_settings_toggle(
         p,
         1,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+    use super::render_settings_overlay;
+    use crate::app::{
+        state::{AgentProfileForm, AppState, SavedAgentProfile, SettingsSection},
+        Mode,
+    };
+
+    fn rendered_text(app: &AppState) -> String {
+        let area = Rect::new(0, 0, 120, 36);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_settings_overlay(app, frame, area))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn agents_settings_visibly_offers_native_harnesses_and_saved_profiles() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Settings;
+        app.settings.section = SettingsSection::Agents;
+        app.saved_agent_profiles = vec![SavedAgentProfile {
+            role: "reviewer".to_string(),
+            native_cwd: "/tmp/reviewer".to_string(),
+            harness: "claude".to_string(),
+            replicas_assigned: 2,
+        }];
+
+        let rendered = rendered_text(&app);
+        for expected in [
+            "create Codex agent",
+            "create Pi agent",
+            "create Claude agent",
+            "reviewer",
+            "enter starts a saved profile",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_settings_visibly_renders_the_create_form_and_agents_file() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Settings;
+        app.settings.section = SettingsSection::Agents;
+        app.settings.agent_profile_form = Some(AgentProfileForm {
+            existing_role: None,
+            role: "reviewer".to_string(),
+            harness: "pi".to_string(),
+            native_cwd: "/workspace".to_string(),
+            instructions: "review this change".to_string(),
+            selected_field: 0,
+        });
+
+        let rendered = rendered_text(&app);
+        for expected in [
+            "new agent profile",
+            "reviewer",
+            "pi",
+            "/workspace",
+            "AGENTS.md",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered:?}"
+            );
+        }
+    }
 }

@@ -44,6 +44,7 @@ const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+const SESSION_SAVE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
@@ -56,7 +57,7 @@ use crossterm::{
 use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, Notify};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::events::AppEvent;
@@ -109,6 +110,10 @@ pub struct App {
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
+    /// Persistent, per-user registry of saved agent profiles + the roster of
+    /// every agent instance that has existed. Saved alongside the session but in
+    /// its own file (`agents.json`); see `crate::agent_registry`.
+    pub(crate) agent_registry: crate::agent_registry::AgentRegistry,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
@@ -125,6 +130,7 @@ pub struct App {
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
+    pub(crate) pending_agent_spawns: Vec<agents::DeferredAgentSpawn>,
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
@@ -136,11 +142,13 @@ pub struct App {
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
+    pub(crate) pending_agent_spawn_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
-    pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) session_save_thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    session_save_retry_attempt: u8,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
     tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
@@ -557,6 +565,7 @@ impl App {
             workspaces,
             active,
             previous_pane_focus: None,
+            saved_agent_profiles: Vec::new(),
             selected,
             mode,
             should_quit: false,
@@ -577,6 +586,9 @@ impl App {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            workspace_create_cwd_input: String::new(),
+            workspace_create_cwd_editing: false,
+            workspace_create_cwd_replace_on_type: false,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -663,7 +675,8 @@ impl App {
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
-            prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
+            prompt_new_workspace_name: config.ui.prompt_new_workspace_name
+                || crate::build_info::channel() == "ohmyherdr",
             pane_borders: config.ui.pane_borders,
             pane_outer_borders: config.ui.pane_outer_borders,
             pane_scrollbars: config.ui.pane_scrollbars,
@@ -701,6 +714,7 @@ impl App {
                 list: state::SelectionListState::new(0),
                 original_palette: None,
                 original_theme: None,
+                agent_profile_form: None,
             },
             integration_recommendations: crate::integration::integration_recommendations(),
             agent_manifest_summaries,
@@ -712,6 +726,8 @@ impl App {
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
+            plugin_command_root_leases: std::collections::HashMap::new(),
+            plugin_command_lease_roots: std::collections::HashMap::new(),
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
@@ -777,6 +793,7 @@ impl App {
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
+            pending_agent_spawns: Vec::new(),
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
             last_pane_click: None,
@@ -790,9 +807,11 @@ impl App {
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
+            pending_agent_spawn_deadline: None,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,
+            session_save_retry_attempt: 0,
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),
@@ -808,6 +827,9 @@ impl App {
             api_rx,
             event_hub,
             last_focus,
+            agent_registry: (!no_session)
+                .then(crate::agent_registry::load)
+                .unwrap_or_else(crate::agent_registry::AgentRegistry::new),
             no_session,
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
@@ -820,6 +842,37 @@ impl App {
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
+        if !app.no_session {
+            match crate::agent_registry::ensure_owned_instructions() {
+                Ok(registry) => app.agent_registry = registry,
+                Err(err) => warn!(err = %err, "failed to migrate agent profile instructions"),
+            }
+        }
+        app.sync_saved_agent_profiles();
+        if !no_session && std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR).is_none() {
+            let mut live_agent_instance_ids = Vec::new();
+            let mut legacy_live_agent_names = Vec::new();
+            for terminal in app.state.terminals.values() {
+                if let Some(instance_id) = terminal.live_roster_instance_id() {
+                    live_agent_instance_ids.push(instance_id.to_string());
+                } else if let Some(agent_name) = terminal.agent_name.as_ref() {
+                    legacy_live_agent_names.push(agent_name.clone());
+                }
+            }
+            if app.agent_registry.roster_terminate_missing_live_instances(
+                &live_agent_instance_ids,
+                &legacy_live_agent_names,
+            ) {
+                if let Err(err) = app.update_agent_registry(|registry| {
+                    registry.roster_terminate_missing_live_instances(
+                        &live_agent_instance_ids,
+                        &legacy_live_agent_names,
+                    )
+                }) {
+                    tracing::warn!(err = %err, "failed to persist reconciled agent registry");
+                }
+            }
+        }
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app
@@ -851,6 +904,8 @@ impl App {
         let pane_id_aliases = crate::persist::handoff_pane_aliases(snapshot, &workspaces);
 
         app.no_session = false;
+        app.agent_registry = crate::agent_registry::load();
+        app.sync_saved_agent_profiles();
         app.state.installed_plugins = load_plugin_registry(app.no_session);
         let now = Instant::now();
         if background_update_check_enabled(app.no_session, app.update_version_check_enabled) {
@@ -893,6 +948,8 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        app.state.mark_session_dirty();
+        app.schedule_session_save();
         Ok(app)
     }
 
@@ -1509,7 +1566,8 @@ impl App {
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
-                self.state.prompt_new_workspace_name = config.ui.prompt_new_workspace_name;
+                self.state.prompt_new_workspace_name = config.ui.prompt_new_workspace_name
+                    || crate::build_info::channel() == "ohmyherdr";
                 self.state.pane_borders = config.ui.pane_borders;
                 self.state.pane_outer_borders = config.ui.pane_outer_borders;
                 self.state.pane_scrollbars = config.ui.pane_scrollbars;
@@ -1992,8 +2050,39 @@ mod tests {
     use crate::workspace::Workspace;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::Cell;
+    use std::ffi::OsString;
     use std::rc::Rc;
     use std::sync::Mutex;
+
+    struct SessionTestEnvGuard {
+        config_home: Option<OsString>,
+        session: Option<OsString>,
+    }
+
+    impl SessionTestEnvGuard {
+        fn set(config_home: &std::path::Path) -> Self {
+            let guard = Self {
+                config_home: std::env::var_os("XDG_CONFIG_HOME"),
+                session: std::env::var_os(crate::session::SESSION_ENV_VAR),
+            };
+            std::env::set_var("XDG_CONFIG_HOME", config_home);
+            std::env::remove_var(crate::session::SESSION_ENV_VAR);
+            guard
+        }
+    }
+
+    impl Drop for SessionTestEnvGuard {
+        fn drop(&mut self) {
+            match self.config_home.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match self.session.take() {
+                Some(value) => std::env::set_var(crate::session::SESSION_ENV_VAR, value),
+                None => std::env::remove_var(crate::session::SESSION_ENV_VAR),
+            }
+        }
+    }
 
     fn raw_key(
         code: KeyCode,
@@ -4117,6 +4206,17 @@ mod tests {
                 crate::api::schema::AgentViewClearParams::default(),
             ),
         };
+        let agent_spawn = crate::api::schema::Request {
+            id: "req_spawn".into(),
+            method: crate::api::schema::Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+                role: "reviewer".into(),
+                kind: Some("pi".into()),
+                tab_id: None,
+                cwd_mode: "tab".into(),
+                timeout_ms: None,
+                args: Vec::new(),
+            }),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -4127,6 +4227,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&pane_focus_direction));
         assert!(crate::api::request_changes_ui(&pane_resize));
         assert!(crate::api::request_changes_ui(&agent_view));
+        assert!(crate::api::request_changes_ui(&agent_spawn));
     }
 
     #[test]
@@ -5074,12 +5175,174 @@ mod tests {
     }
 
     #[test]
+    fn background_session_save_backs_off_and_resets_after_storage_recovers() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("background-session-save-retry");
+        let _env = SessionTestEnvGuard::set(&config_home);
+
+        let session_dir = crate::session::data_dir();
+        std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+        std::fs::write(&session_dir, "not a directory").unwrap();
+
+        let mut app = test_app();
+        app.no_session = false;
+        app.state.workspaces = vec![Workspace::test_new("autosave-retry")];
+        app.state.ensure_test_terminals();
+        app.start_background_session_save();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "background session save did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        app.sync_session_save_schedule();
+        let first_retry = app.session_save_deadline.expect("first retry deadline");
+        assert!(
+            first_retry.saturating_duration_since(Instant::now()) >= Duration::from_secs(4),
+            "first failed save should wait for the normal debounce"
+        );
+
+        app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
+        app.handle_scheduled_tasks(Instant::now(), false);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "second background session save did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        app.sync_session_save_schedule();
+        let second_retry = app.session_save_deadline.expect("second retry deadline");
+        assert!(
+            second_retry.saturating_duration_since(Instant::now()) >= Duration::from_secs(9),
+            "consecutive failed saves should back off before the next retry"
+        );
+
+        std::fs::remove_file(&session_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
+        app.handle_scheduled_tasks(Instant::now(), false);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "retried background session save did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        app.sync_session_save_schedule();
+        assert!(session_dir.join("session.json").exists());
+        assert!(app.session_save_thread.is_none());
+
+        std::fs::remove_dir_all(&session_dir).unwrap();
+        std::fs::write(&session_dir, "not a directory again").unwrap();
+        app.state.mark_session_dirty();
+        app.sync_session_save_schedule();
+        app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
+        app.handle_scheduled_tasks(Instant::now(), false);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "post-recovery background session save did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        app.sync_session_save_schedule();
+        let reset_retry = app.session_save_deadline.expect("reset retry deadline");
+        let reset_retry_delay = reset_retry.saturating_duration_since(Instant::now());
+        assert!(
+            reset_retry_delay >= Duration::from_secs(4)
+                && reset_retry_delay < Duration::from_secs(9),
+            "a successful save should reset the retry delay: {reset_retry_delay:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn forced_session_save_schedules_retry_after_storage_failure() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("forced-session-save-retry");
+        let _env = SessionTestEnvGuard::set(&config_home);
+
+        let session_dir = crate::session::data_dir();
+        std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+        std::fs::write(&session_dir, "not a directory").unwrap();
+
+        let mut app = test_app();
+        app.no_session = false;
+        app.state.workspaces = vec![Workspace::test_new("forced-save-retry")];
+        app.state.ensure_test_terminals();
+
+        app.save_session_now();
+
+        assert!(app.state.session_dirty);
+        let retry_deadline = app.session_save_deadline.expect("retry deadline");
+        assert!(
+            retry_deadline.saturating_duration_since(Instant::now()) >= Duration::from_secs(4),
+            "failed forced save should wait for the normal debounce"
+        );
+
+        std::fs::remove_file(&session_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        app.start_background_session_save();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app
+            .session_save_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "retried forced session save did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        app.sync_session_save_schedule();
+        assert!(session_dir.join("session.json").exists());
+        assert_eq!(app.session_save_retry_attempt, 0);
+
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
     fn background_session_save_reschedules_when_writer_is_busy() {
         let mut app = test_app();
         app.no_session = false;
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         app.session_save_thread = Some(std::thread::spawn(move || {
             let _ = release_rx.recv();
+            Ok(())
         }));
 
         app.start_background_session_save();
@@ -5101,6 +5364,7 @@ mod tests {
         app.session_save_thread = Some(std::thread::spawn(move || {
             let _ = release_rx.recv();
             done_tx.send(()).unwrap();
+            Ok(())
         }));
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));

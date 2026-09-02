@@ -251,6 +251,12 @@ pub struct PaneStateUpdate {
     pub presentation: crate::terminal::EffectivePresentation,
     pub agent_name_changed: bool,
     pub agent_released: bool,
+    /// Durable roster instance owning the current terminal state.
+    pub roster_instance_id: Option<String>,
+    /// Durable roster instance captured before a release clears terminal ownership.
+    pub released_roster_instance_id: Option<String>,
+    /// Managed live name captured before a validated release clears it.
+    pub released_agent_name: Option<String>,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
     pub suppress_completion: bool,
 }
@@ -1035,10 +1041,13 @@ impl AppState {
             .into_iter()
             .filter_map(|(ws_idx, pane_id, terminal_id)| {
                 let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
-                let mutation = self
-                    .terminals
-                    .get_mut(&terminal_id)?
-                    .expire_agent_metadata_at(scheduled_deadline, now)?;
+                let (mutation, roster_instance_id) = {
+                    let terminal = self.terminals.get_mut(&terminal_id)?;
+                    let roster_instance_id =
+                        terminal.live_roster_instance_id().map(ToOwned::to_owned);
+                    let mutation = terminal.expire_agent_metadata_at(scheduled_deadline, now)?;
+                    (mutation, roster_instance_id)
+                };
                 let change = mutation.effective_state_change?;
                 let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
                 let update = PaneStateUpdate {
@@ -1056,6 +1065,9 @@ impl AppState {
                     presentation: change.presentation.clone(),
                     agent_name_changed: false,
                     agent_released: false,
+                    roster_instance_id,
+                    released_roster_instance_id: None,
+                    released_agent_name: None,
                     agent_release_status: None,
                     suppress_completion: false,
                 };
@@ -1643,11 +1655,25 @@ impl AppState {
                         .any(|pane| pane.attached_terminal_id == terminal_id)
                 })
             });
-            if !still_attached
-                && self.terminals.remove(&terminal_id).is_some()
-                && !self.terminal_runtime_shutdowns.contains(&terminal_id)
-            {
-                self.terminal_runtime_shutdowns.push(terminal_id);
+            if !still_attached {
+                let Some(terminal) = self.terminals.remove(&terminal_id) else {
+                    continue;
+                };
+                if self
+                    .terminal_runtime_shutdowns
+                    .iter()
+                    .all(|shutdown| shutdown.terminal_id != terminal_id)
+                {
+                    self.terminal_runtime_shutdowns.push(
+                        crate::app::state::PendingTerminalShutdown {
+                            terminal_id,
+                            released_roster_instance_id: terminal
+                                .live_roster_instance_id()
+                                .map(ToOwned::to_owned),
+                            released_agent_name: terminal.agent_name.clone(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -2982,14 +3008,20 @@ impl AppState {
             unchanged_change,
             managed_launch_pending,
             suppress_acquisition_completion,
+            previous_agent_name,
+            previous_roster_instance_id,
+            roster_instance_id,
         ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
             let previous_agent_name = terminal.agent_name.clone();
+            let previous_roster_instance_id =
+                terminal.live_roster_instance_id().map(ToOwned::to_owned);
             let managed_launch_pending = terminal.managed_agent_launch_pending();
             let mutation = update(terminal)?;
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
             let agent_name_changed = terminal.agent_name != previous_agent_name;
+            let roster_instance_id = terminal.live_roster_instance_id().map(ToOwned::to_owned);
             let unchanged_change = (mutation.agent_released || agent_name_changed)
                 .then(|| terminal.unchanged_effective_state_change_at(now));
             (
@@ -2999,6 +3031,9 @@ impl AppState {
                 unchanged_change,
                 managed_launch_pending,
                 suppress_acquisition_completion,
+                previous_agent_name,
+                previous_roster_instance_id,
+                roster_instance_id,
             )
         };
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
@@ -3038,6 +3073,11 @@ impl AppState {
             presentation: change.presentation.clone(),
             agent_name_changed,
             agent_released,
+            roster_instance_id,
+            released_roster_instance_id: agent_released
+                .then_some(previous_roster_instance_id)
+                .flatten(),
+            released_agent_name: agent_released.then_some(previous_agent_name).flatten(),
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
             suppress_completion,
         };
@@ -3051,11 +3091,26 @@ impl AppState {
             .min()
     }
 
-    pub(crate) fn reconcile_managed_agents_at(&mut self, now: Instant) -> Vec<(usize, PaneId)> {
-        let mut changed_terminals = std::collections::HashSet::new();
+    pub(crate) fn reconcile_managed_agents_at(&mut self, now: Instant) -> Vec<PaneStateUpdate> {
+        let mut changed_terminals = std::collections::HashMap::new();
         for (terminal_id, terminal) in &mut self.terminals {
+            let before = terminal.unchanged_effective_state_change_at(now);
+            let previous_agent_name = terminal.agent_name.clone();
+            let previous_roster_instance_id =
+                terminal.live_roster_instance_id().map(ToOwned::to_owned);
             if terminal.reconcile_managed_agent_at(now, false) {
-                changed_terminals.insert(terminal_id.clone());
+                let after = terminal.unchanged_effective_state_change_at(now);
+                changed_terminals.insert(
+                    terminal_id.clone(),
+                    (
+                        before,
+                        after,
+                        previous_agent_name,
+                        previous_roster_instance_id,
+                        terminal.live_roster_instance_id().map(ToOwned::to_owned),
+                        terminal.agent_name.clone(),
+                    ),
+                );
             }
         }
         if changed_terminals.is_empty() {
@@ -3069,9 +3124,49 @@ impl AppState {
                 let changed_terminals = &changed_terminals;
                 workspace.tabs.iter().flat_map(move |tab| {
                     tab.panes.iter().filter_map(move |(&pane_id, pane)| {
-                        changed_terminals
-                            .contains(&pane.attached_terminal_id)
-                            .then_some((ws_idx, pane_id))
+                        let (
+                            before,
+                            after,
+                            previous_agent_name,
+                            previous_roster_instance_id,
+                            roster_instance_id,
+                            agent_name,
+                        ) = changed_terminals.get(&pane.attached_terminal_id)?;
+                        let agent_released = previous_agent_name.is_some() && agent_name.is_none();
+                        Some(PaneStateUpdate {
+                            pane_id,
+                            ws_idx,
+                            previous_agent_label: before.agent_label.clone(),
+                            previous_known_agent: before.known_agent,
+                            previous_state: before.state,
+                            previous_seen: pane.seen,
+                            previous_presentation: before.presentation.clone(),
+                            agent_label: if agent_released {
+                                before.agent_label.clone()
+                            } else {
+                                after.agent_label.clone()
+                            },
+                            known_agent: if agent_released {
+                                before.known_agent
+                            } else {
+                                after.known_agent
+                            },
+                            state: after.state,
+                            seen: pane.seen,
+                            presentation: after.presentation.clone(),
+                            agent_name_changed: previous_agent_name.as_ref() != agent_name.as_ref(),
+                            agent_released,
+                            roster_instance_id: roster_instance_id.clone(),
+                            released_roster_instance_id: agent_released
+                                .then_some(previous_roster_instance_id.clone())
+                                .flatten(),
+                            released_agent_name: agent_released
+                                .then_some(previous_agent_name.clone())
+                                .flatten(),
+                            agent_release_status: agent_released
+                                .then(|| pane_agent_status(after.state, pane.seen)),
+                            suppress_completion: false,
+                        })
                     })
                 })
             })
@@ -5964,6 +6059,11 @@ mod tests {
             .get_mut(&terminal_id)
             .unwrap()
             .set_detected_state(Some(Agent::Pi), AgentState::Working);
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("reviewer".into());
         assert_eq!(
             state.terminals.get(&terminal_id).unwrap().state,
             AgentState::Working
@@ -5979,6 +6079,7 @@ mod tests {
         assert_eq!(update.agent_label.as_deref(), Some("pi"));
         assert_eq!(update.known_agent, Some(Agent::Pi));
         assert!(update.agent_released);
+        assert_eq!(update.released_agent_name.as_deref(), Some("reviewer"));
         assert_eq!(
             update.agent_release_status,
             Some(crate::api::schema::AgentStatus::Done)
@@ -5995,10 +6096,23 @@ mod tests {
         let pane_id = state.workspaces[0].test_split(Direction::Horizontal);
         state.ensure_test_terminals();
         let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("reviewer".into());
 
         state.close_pane();
 
         assert!(!state.terminals.contains_key(&terminal_id));
+        assert_eq!(state.terminal_runtime_shutdowns.len(), 1);
+        assert_eq!(state.terminal_runtime_shutdowns[0].terminal_id, terminal_id);
+        assert_eq!(
+            state.terminal_runtime_shutdowns[0]
+                .released_agent_name
+                .as_deref(),
+            Some("reviewer")
+        );
         state.assert_invariants_for_test();
     }
 

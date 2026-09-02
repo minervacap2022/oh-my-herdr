@@ -37,6 +37,10 @@ pub use self::{
     window_title::{WindowTitlePart, WindowTitleTemplate, WindowTitleToken},
 };
 
+pub(crate) use self::io::product_name;
+
+#[cfg(test)]
+pub(crate) use self::io::app_dir_name;
 pub(crate) use self::keybinds::parse_key_combo;
 pub(crate) use self::{
     io::upsert_top_level_bool,
@@ -55,11 +59,6 @@ pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
-
-#[cfg(test)]
-pub(crate) fn app_dir_name() -> &'static str {
-    io::app_dir_name()
-}
 
 #[cfg(test)]
 pub(crate) fn test_config_env_lock() -> &'static std::sync::Mutex<()> {

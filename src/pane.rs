@@ -5,6 +5,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::Instant;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use portable_pty::CommandBuilder;
@@ -1039,9 +1042,13 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    #[cfg(unix)]
+    child_session_id: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
+    has_received_input: Arc<AtomicBool>,
+    last_input_at: Arc<Mutex<Option<Instant>>>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
@@ -1235,9 +1242,23 @@ impl Drop for PaneRuntime {
             shutdown_pane_processes(
                 self.pane_id,
                 self.child_pid.load(Ordering::Acquire),
+                self.captured_child_session_id(),
                 self.child_wait_completed.as_deref(),
             );
         }
+    }
+}
+
+impl PaneRuntime {
+    #[cfg(unix)]
+    fn captured_child_session_id(&self) -> Option<u32> {
+        let session_id = self.child_session_id.load(Ordering::Acquire);
+        (session_id != 0).then_some(session_id)
+    }
+
+    #[cfg(not(unix))]
+    fn captured_child_session_id(&self) -> Option<u32> {
+        None
     }
 }
 
@@ -1280,21 +1301,59 @@ fn wait_for_processes_to_exit(
     }
 }
 
+#[cfg(unix)]
+fn unix_shutdown_processes(
+    captured_session_id: Option<u32>,
+    child_pid: u32,
+    child_wait_completed: Option<bool>,
+    session_processes: impl FnOnce(u32) -> Vec<u32>,
+) -> Vec<u32> {
+    let mut pids = captured_session_id
+        .map(session_processes)
+        .unwrap_or_default();
+    if pids.is_empty() && captured_session_id.is_none() && child_wait_completed != Some(true) {
+        pids.push(child_pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 fn shutdown_pane_processes(
     pane_id: PaneId,
     child_pid: u32,
+    captured_session_id: Option<u32>,
     child_wait_completed: Option<&AtomicBool>,
 ) {
     if child_pid == 0 {
         return;
     }
 
-    let mut pids = crate::platform::session_processes(child_pid);
+    #[cfg(unix)]
+    let child_wait_completed_at_shutdown =
+        child_wait_completed.map(|flag| flag.load(Ordering::Acquire));
+    #[cfg(unix)]
+    let pids = unix_shutdown_processes(
+        captured_session_id,
+        child_pid,
+        child_wait_completed_at_shutdown,
+        crate::platform::session_processes,
+    );
+    #[cfg(not(unix))]
+    let pids = {
+        let _ = captured_session_id;
+        let mut pids = crate::platform::session_processes(child_pid);
+        if pids.is_empty() {
+            pids.push(child_pid);
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    };
+
     if pids.is_empty() {
-        pids.push(child_pid);
+        return;
     }
-    pids.sort_unstable();
-    pids.dedup();
 
     for (signal, grace) in [
         (
@@ -1600,6 +1659,7 @@ impl PaneRuntime {
         shutdown_pane_processes(
             self.pane_id,
             self.child_pid.load(Ordering::Acquire),
+            self.captured_child_session_id(),
             self.child_wait_completed.as_deref(),
         );
         self.preserve_processes_on_drop = true;
@@ -1657,6 +1717,7 @@ impl PaneRuntime {
         crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_session_id: self.captured_child_session_id(),
             rows,
             cols,
             cell_width_px,
@@ -1669,6 +1730,17 @@ impl PaneRuntime {
             input_state: self.input_state(),
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
+            has_received_input: self.has_received_input(),
+            last_input_age_ms: self
+                .last_input_at
+                .lock()
+                .map(|last_input_at| {
+                    last_input_at.map(|input_at| {
+                        input_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                    })
+                })
+                .unwrap_or(Some(0)),
+            input_timing_captured_at_ms: Some(unix_millis()),
         }
     }
 
@@ -1870,6 +1942,7 @@ impl PaneRuntime {
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_session_id: handoff_child_session_id,
             rows,
             cols,
             cell_width_px,
@@ -1879,6 +1952,9 @@ impl PaneRuntime {
             input_state,
             terminal_title,
             initial_history_ansi,
+            has_received_input,
+            last_input_age_ms,
+            input_timing_captured_at_ms,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -1912,9 +1988,25 @@ impl PaneRuntime {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
+        #[cfg(unix)]
+        let child_session_id = Arc::new(AtomicU32::new(
+            handoff_child_session_id
+                .unwrap_or_else(|| crate::platform::process_session_id(child_pid).unwrap_or(0)),
+        ));
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
+        let (has_received_input, restored_input_age) = restored_handoff_input_timing(
+            has_received_input,
+            last_input_age_ms,
+            input_timing_captured_at_ms,
+            unix_millis(),
+        );
+        let has_received_input = Arc::new(AtomicBool::new(has_received_input));
+        let last_input_at =
+            Arc::new(Mutex::new(restored_input_age.map(|age| {
+                Instant::now().checked_sub(age).unwrap_or_else(Instant::now)
+            })));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
 
@@ -2000,9 +2092,13 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            #[cfg(unix)]
+            child_session_id,
             reported_cwd,
             child_wait_completed: None,
             kitty_keyboard_flags,
+            has_received_input,
+            last_input_at,
             content_seq,
             detection_content_seq,
             full_lifecycle_authority_active,
@@ -2057,8 +2153,17 @@ impl PaneRuntime {
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
+        let spawned_child_pid = spawned.child.process_id();
+        #[cfg(unix)]
+        let child_session_id = Arc::new(AtomicU32::new(
+            spawned_child_pid
+                .and_then(crate::platform::process_session_id)
+                .unwrap_or(0),
+        ));
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
+        let has_received_input = Arc::new(AtomicBool::new(false));
+        let last_input_at = Arc::new(Mutex::new(None));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
@@ -2068,7 +2173,7 @@ impl PaneRuntime {
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
-            if let Some(pid) = child.process_id() {
+            if let Some(pid) = spawned_child_pid {
                 child_pid.store(pid, Ordering::Release);
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
@@ -2551,9 +2656,13 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            #[cfg(unix)]
+            child_session_id,
             reported_cwd,
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
+            has_received_input,
+            last_input_at,
             content_seq,
             detection_content_seq,
             full_lifecycle_authority_active,
@@ -2604,6 +2713,23 @@ impl PaneRuntime {
 
     pub(crate) fn content_seq(&self) -> u64 {
         self.content_seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_received_input(&self) -> bool {
+        self.has_received_input.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn input_was_sent_within(&self, duration: std::time::Duration) -> bool {
+        self.last_input_at.lock().map_or(true, |last_input_at| {
+            last_input_at.is_some_and(|input_at| input_at.elapsed() <= duration)
+        })
+    }
+
+    fn record_input(&self) {
+        self.has_received_input.store(true, Ordering::Release);
+        if let Ok(mut last_input_at) = self.last_input_at.lock() {
+            *last_input_at = Some(Instant::now());
+        }
     }
 
     /// Resize if the dimensions actually changed.
@@ -2835,14 +2961,23 @@ impl PaneRuntime {
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.io.send_bytes(bytes).await
+        let result = self.io.send_bytes(bytes).await;
+        if result.is_ok() {
+            self.record_input();
+        }
+        result
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        let result = self.io.try_send_bytes(bytes);
+        if result.is_ok() {
+            self.record_input();
+        }
+        result
     }
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+        self.record_input();
         self.io.send_bytes_after(bytes, delay);
     }
 
@@ -3013,6 +3148,42 @@ impl PaneRuntime {
     }
 }
 
+#[cfg(unix)]
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(unix)]
+fn restored_handoff_input_timing(
+    has_received_input: bool,
+    last_input_age_ms: Option<u64>,
+    input_timing_captured_at_ms: Option<u64>,
+    imported_at_ms: u64,
+) -> (bool, Option<std::time::Duration>) {
+    // Handoff manifests from before input timing was introduced omit all
+    // three fields. Treat them as recently used instead of risking immediate
+    // shell reuse after an older server handoff.
+    let legacy_missing_timing = input_timing_captured_at_ms.is_none();
+    let transfer_age_ms = input_timing_captured_at_ms
+        .map(|captured_at_ms| imported_at_ms.saturating_sub(captured_at_ms))
+        .unwrap_or(0);
+    let restored_input_age = if legacy_missing_timing {
+        Some(std::time::Duration::ZERO)
+    } else {
+        last_input_age_ms
+            .map(|age_ms| age_ms.saturating_add(transfer_age_ms))
+            .map(std::time::Duration::from_millis)
+    };
+    (
+        has_received_input || restored_input_age.is_some(),
+        restored_input_age,
+    )
+}
+
 #[cfg(test)]
 impl PaneRuntime {
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
@@ -3072,9 +3243,13 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                #[cfg(unix)]
+                child_session_id: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+                has_received_input: Arc::new(AtomicBool::new(false)),
+                last_input_at: Arc::new(Mutex::new(None)),
                 content_seq: Arc::new(AtomicU64::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -3211,6 +3386,58 @@ mod tests {
     #[test]
     fn shutdown_liveness_treats_missing_process_as_gone() {
         assert!(!process_alive_for_shutdown(43, 42, false, |_| false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_enumerates_captured_session_after_leader_reaped() {
+        let pids = unix_shutdown_processes(Some(77), 42, Some(true), |session_id| {
+            assert_eq!(session_id, 77);
+            vec![43, 44]
+        });
+
+        assert_eq!(pids, [43, 44]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_does_not_fall_back_to_child_pid_after_captured_session_empties() {
+        let pids = unix_shutdown_processes(Some(77), 42, Some(false), |session_id| {
+            assert_eq!(session_id, 77);
+            Vec::new()
+        });
+
+        assert!(pids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_skips_stale_child_pid_when_leader_reaped_without_session_scope() {
+        let pids = unix_shutdown_processes(None, 42, Some(true), |_| {
+            panic!("no session scope should not be enumerated")
+        });
+
+        assert!(pids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_falls_back_to_live_direct_child_without_session_scope() {
+        let pids = unix_shutdown_processes(None, 42, Some(false), |_| {
+            panic!("no session scope should not be enumerated")
+        });
+
+        assert_eq!(pids, [42]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_falls_back_when_child_reaping_is_not_observed() {
+        let pids = unix_shutdown_processes(None, 42, None, |_| {
+            panic!("no session scope should not be enumerated")
+        });
+
+        assert_eq!(pids, [42]);
     }
 
     #[cfg(unix)]
@@ -3581,8 +3808,11 @@ mod tests {
         runtime.test_process_pty_bytes("\x1b]2;✳ 修复🙂标题\x1b\\".as_bytes());
         runtime.terminal.clear_agent_osc_state();
         assert_eq!(runtime.agent_osc_title(), "");
+        runtime.record_input();
+        runtime.child_session_id.store(56, Ordering::Release);
         let pane = runtime.handoff_runtime_state(12);
 
+        assert_eq!(pane.child_session_id, Some(56));
         assert_eq!(pane.keyboard_protocol_flags, 5);
         assert_eq!(pane.terminal_title.as_deref(), Some("✳ 修复🙂标题"));
         assert_eq!(
@@ -3598,6 +3828,73 @@ mod tests {
                 modify_other_keys: true,
                 color_scheme_reporting: true,
             })
+        );
+        assert!(pane.has_received_input);
+        assert!(pane.last_input_age_ms.is_some());
+        assert!(pane.input_timing_captured_at_ms.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_handoff_input_timing_includes_transfer_time_and_guards_legacy() {
+        let (used, age) = restored_handoff_input_timing(true, Some(25), Some(1_000), 1_650);
+        assert!(used);
+        assert_eq!(age, Some(std::time::Duration::from_millis(675)));
+
+        let (used, age) = restored_handoff_input_timing(false, None, None, 1_650);
+        assert!(used);
+        assert_eq!(age, Some(std::time::Duration::ZERO));
+
+        let (used, age) = restored_handoff_input_timing(true, Some(25), None, 1_650);
+        assert!(used);
+        assert_eq!(age, Some(std::time::Duration::ZERO));
+
+        let (used, age) = restored_handoff_input_timing(false, None, Some(1_000), 1_650);
+        assert!(!used);
+        assert_eq!(age, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_runtime_input_fields_deserialize_conservatively() {
+        let state = crate::handoff_runtime::HandoffRuntimeState {
+            pane_id: 12,
+            child_pid: 34,
+            child_session_id: Some(56),
+            rows: 24,
+            cols: 80,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            keyboard_protocol_flags: 0,
+            keyboard_protocol_ansi: None,
+            input_state: None,
+            terminal_title: None,
+            initial_history_ansi: None,
+            has_received_input: true,
+            last_input_age_ms: Some(25),
+            input_timing_captured_at_ms: Some(1_000),
+        };
+        let mut value = serde_json::to_value(state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("child_session_id");
+        object.remove("has_received_input");
+        object.remove("last_input_age_ms");
+        object.remove("input_timing_captured_at_ms");
+
+        let legacy: crate::handoff_runtime::HandoffRuntimeState =
+            serde_json::from_value(value).unwrap();
+        assert!(!legacy.has_received_input);
+        assert!(legacy.child_session_id.is_none());
+        assert!(legacy.last_input_age_ms.is_none());
+        assert!(legacy.input_timing_captured_at_ms.is_none());
+        assert_eq!(
+            restored_handoff_input_timing(
+                legacy.has_received_input,
+                legacy.last_input_age_ms,
+                legacy.input_timing_captured_at_ms,
+                1_650,
+            ),
+            (true, Some(std::time::Duration::ZERO))
         );
     }
 
@@ -3641,9 +3938,13 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            #[cfg(unix)]
+            child_session_id: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+            has_received_input: Arc::new(AtomicBool::new(false)),
+            last_input_at: Arc::new(Mutex::new(None)),
             content_seq: Arc::new(AtomicU64::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -3673,9 +3974,13 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            #[cfg(unix)]
+            child_session_id: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
+            has_received_input: Arc::new(AtomicBool::new(false)),
+            last_input_at: Arc::new(Mutex::new(None)),
             content_seq: Arc::new(AtomicU64::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -3691,6 +3996,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn pty_input_marks_runtime_as_used() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+
+        assert!(!runtime.has_received_input());
+        assert!(!runtime.input_was_sent_within(std::time::Duration::from_secs(1)));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"echo used\n"))
+            .unwrap();
+        assert!(runtime.has_received_input());
+        assert!(runtime.input_was_sent_within(std::time::Duration::from_secs(1)));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"echo used\n"));
     }
 
     #[tokio::test]

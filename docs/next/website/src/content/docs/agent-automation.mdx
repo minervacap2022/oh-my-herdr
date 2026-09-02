@@ -56,6 +56,42 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+Persistent profile instances are addressable by role. A bare live role resolves
+when it has one instance; use `role@w:t:p` to select one replica explicitly.
+`agent broadcast <role> <text>` submits the same prompt to every live instance
+of that role.
+
+`agent roster` lists every persistent instance, including terminated replicas.
+Use `agent revive <instance-id>` to restore one archived instance with its
+original role, replica suffix, and roster identity.
+
+### Persistent profile spawn
+
+Use `agent spawn` when a role should keep its profile across restarts and live handoffs of the current Herdr session. Profiles, roster records, and replica counters are session-scoped and are not shared by named sessions. It creates or reuses the saved profile for the role, starts the first instance as the role name, and assigns later live instances names such as `reviewer-replica-1`; the lowest replica number not currently in use is reused after an instance exits. In the selected tab (or the active tab by default), Herdr reuses the first available shell; when no shell is available, it auto-splits the last pane to make room.
+
+`--kind` overrides the saved profile harness for this launch; omitting it uses the saved harness (default `codex`). Use `--tab <tab_id>` to target a background tab without changing focus. `--cwd tab` (the default) launches from the target tab's root-pane working directory. `--cwd agent` uses the profile's native directory, which is seeded from that directory on its first spawn. An available shell is used immediately. A fresh root shell that is still starting is waited on for up to two seconds and retained if it does not become ready. When Herdr must auto-split a pane, the request waits for the new shell to reach its prompt before submitting the agent command, polling for up to two seconds; if the shell does not become ready, Herdr rolls back only the new pane and returns `agent_spawn_failed`. After command submission, the response can report `launch_pending` while detection settles; `--timeout` is the managed detection deadline (3001–300000 milliseconds), not a promise that the response waits for readiness. Follow it with `agent wait <name> --until idle` when orchestration requires a ready agent.
+
+```bash
+herdr agent spawn reviewer --kind claude --tab w1:t2 --cwd tab -- --model sonnet
+herdr agent wait reviewer --until idle
+```
+
+Create a named native profile explicitly, then click its sidebar card or spawn it by role:
+
+```sh
+herdr agent create reviewer --harness codex --cwd /workspace --instructions-file ./reviewer.md
+herdr agent profile reviewer
+herdr agent spawn reviewer --cwd agent
+```
+
+### Create and run a native profile in Herdr
+
+The Agents sidebar has a plain **new** control at the bottom-left of the section, matching the Spaces control. It opens the same native-profile form with Codex selected by default; use the harness field to choose Pi or Claude. Each saved profile shows its name and native working directory, followed by its live agent pane entries. In an active Space, click a saved profile to choose **Use space cwd** or **Use agent native cwd**; either choice keeps that profile's `AGENTS.md` attached. Creating a Space prompts for its native working directory and uses `~` when left blank. You can also open **Settings → Agents** (default shortcut: `ctrl+b`, then `s`). Enter the role and native working directory, and save the initial `AGENTS.md` instruction. Press `e` to change a saved profile's native harness or working directory. The profile's own `AGENTS.md` remains attached when those settings change.
+
+`agent create` supports `codex`, `pi`, and `claude`. It creates a session-owned `agent-context/<role>/AGENTS.md`, returns its exact path, and retains that file when you switch the profile's harness. Edit that file to change the agent's durable instructions. Herdr injects it natively: Codex receives `model_instructions_file`, Pi receives `--append-system-prompt`, and Claude receives `--append-system-prompt-file`. `agent profile` and `agent profiles` show saved configuration; the socket also exposes `agent.profile.create`, `agent.profile.get`, `agent.profile.list`, `agent.profile.set`, and `agent.profile.set_md` for automation.
+
+Use `agent.profile.get` and `agent.profile.list` to read saved configuration. `agent.profile.set` atomically updates the profile's harness, native cwd, model, effort, API-key reference, or allowlist; clear optional values with `clear_model`, `clear_effort`, `clear_apikey_ref`, or `clear_allowlist`. Generic spawn applies model and effort for Claude, Codex, and Pi, applies the `tools` array in an allowlist for Claude or Pi, and accepts `apikey_ref` as an `env:NAME` indirection for Claude and Codex. Unsupported settings fail explicitly instead of being silently ignored. An explicit `native_cwd` must be an existing UTF-8 directory. Profile Markdown remains managed through `agent.profile.set_md`.
+
 ## Choose the control surface
 
 | Goal | Command |
@@ -65,6 +101,7 @@ herdr agent rename w1:p2 reviewer
 | Send terminal keys or modifier chords | `pane send-keys` |
 | Wait for text or a regular expression | `pane wait-output` |
 | Start a supported agent in an existing pane | `agent start` |
+| Start a persistent role profile | `agent spawn` |
 | Submit a prompt, optionally waiting for it | `agent prompt` |
 | Send keys to an agent's interactive UI | `agent send-keys` |
 | Wait for agent lifecycle state | `agent wait` |

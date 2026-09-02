@@ -570,6 +570,14 @@ impl TerminalRuntime {
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }
+
+    pub(crate) fn has_received_input(&self) -> bool {
+        self.0.has_received_input()
+    }
+
+    pub(crate) fn input_was_sent_within(&self, duration: std::time::Duration) -> bool {
+        self.0.input_was_sent_within(duration)
+    }
 }
 
 #[cfg(test)]

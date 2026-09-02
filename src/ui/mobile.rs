@@ -736,6 +736,9 @@ fn render_mobile_switcher_content(
 }
 
 fn mobile_agent_detail(entry: &AgentPanelEntry) -> String {
+    if let Some(native_cwd) = entry.profile_native_cwd.as_deref() {
+        return format!("  {native_cwd}");
+    }
     let mut parts = Vec::new();
     if let Some(tab_label) = entry.primary_tab_label.as_deref() {
         parts.push(tab_label.to_string());
@@ -1226,6 +1229,8 @@ mod tests {
             last_agent_state_change_seq: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
+            saved_profile_role: None,
+            profile_native_cwd: None,
         }
     }
 

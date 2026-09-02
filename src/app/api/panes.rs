@@ -1610,7 +1610,6 @@ impl App {
                 self.emit_layout_updated_event(ws_idx, tab_idx);
             }
         }
-
         Ok(())
     }
 
@@ -1922,6 +1921,41 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn pane_close_terminates_managed_roster_instance_after_closing() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.no_session = false;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("reviewer".into());
+        app.agent_registry.roster_register(
+            "reviewer",
+            "reviewer",
+            "reviewer",
+            "",
+            Some(public_pane_id.clone()),
+        );
+
+        let response = app.handle_pane_close(
+            "req".into(),
+            PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.result, crate::api::schema::ResponseResult::Ok {});
+        assert!(app.agent_registry.roster.values().any(|entry| {
+            entry.display_name == "reviewer"
+                && entry.status == crate::agent_registry::AgentStatus::Terminated
+        }));
+        assert!(app.session_save_deadline.is_some());
     }
 
     #[test]

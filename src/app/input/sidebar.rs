@@ -358,6 +358,26 @@ impl AppState {
         Some((detail.ws_idx, detail.tab_idx, detail.pane_id))
     }
 
+    pub(super) fn collapsed_saved_agent_profile_target_at(&self, row: u16) -> Option<String> {
+        if !self.sidebar_collapsed {
+            return None;
+        }
+        let (_, _, detail_area) = crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect);
+        let content = Rect::new(
+            detail_area.x,
+            detail_area.y,
+            detail_area.width,
+            detail_area.height.saturating_sub(1),
+        );
+        if content == Rect::default() || row < content.y || row >= content.y + content.height {
+            return None;
+        }
+        let index = (row - content.y) as usize;
+        crate::ui::agent_panel_entries(self)
+            .get(index)
+            .and_then(|entry| entry.saved_profile_role.clone())
+    }
+
     pub(super) fn workspace_drop_target_at_row(
         &self,
         row: u16,
@@ -482,6 +502,22 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
+    pub(super) fn on_agent_panel_new_button(&self, col: u16, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+        );
+        let rect = crate::ui::agent_panel_new_button_rect(self, detail_area);
+        rect.width > 0
+            && col >= rect.x
+            && col < rect.x + rect.width
+            && row >= rect.y
+            && row < rect.y + rect.height
+    }
+
     pub(super) fn agent_detail_target_at(
         &self,
         row: u16,
@@ -519,6 +555,32 @@ impl AppState {
         }
         None
     }
+
+    pub(super) fn saved_agent_profile_target_at(&self, row: u16) -> Option<String> {
+        crate::ui::agent_panel_entry_at_row(self, row).and_then(|entry| entry.saved_profile_role)
+    }
+
+    pub(super) fn open_agent_profile_spawn_menu(
+        &mut self,
+        role: String,
+        col: u16,
+        row: u16,
+    ) -> bool {
+        let Some(ws_idx) = self
+            .active
+            .or_else(|| self.workspaces.get(self.selected).map(|_| self.selected))
+        else {
+            return false;
+        };
+        self.context_menu = Some(crate::app::state::ContextMenuState {
+            kind: crate::app::state::ContextMenuKind::AgentProfileSpawn { role, ws_idx },
+            x: col,
+            y: row,
+            list: crate::app::state::MenuListState::new(0),
+        });
+        self.mode = crate::app::Mode::ContextMenu;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -530,11 +592,65 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelSort, DragTarget, Mode},
+        app::state::{AgentPanelSort, AppState, DragTarget, Mode},
         config::SidebarCollapsedModeConfig,
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    #[test]
+    fn saved_profile_row_resolves_to_a_spawn_target() {
+        let mut state = AppState::test_new();
+        state.saved_agent_profiles = vec![crate::app::state::SavedAgentProfile {
+            role: "reviewer".into(),
+            native_cwd: "/tmp/reviewer".into(),
+            harness: "codex".into(),
+            replicas_assigned: 0,
+        }];
+        state.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+
+        let (_, panel) = crate::ui::expanded_sidebar_sections(
+            state.view.sidebar_rect,
+            state.sidebar_section_split,
+        );
+        let body = crate::ui::agent_panel_body_rect(panel, false);
+        assert_eq!(
+            state.saved_agent_profile_target_at(body.y),
+            Some("reviewer".into())
+        );
+    }
+
+    #[test]
+    fn clicking_saved_profile_opens_a_cwd_choice_for_the_active_space() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("project")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.saved_agent_profiles = vec![crate::app::state::SavedAgentProfile {
+            role: "ccc".into(),
+            native_cwd: "/tmp/ccc".into(),
+            harness: "codex".into(),
+            replicas_assigned: 0,
+        }];
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+        let body = crate::ui::agent_panel_body_rect(app.state.agent_panel_rect(), false);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x,
+            body.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().expect("profile spawn menu");
+        assert_eq!(menu.items(), vec!["Use space cwd", "Use agent native cwd"]);
+        assert!(matches!(
+            menu.kind,
+            crate::app::state::ContextMenuKind::AgentProfileSpawn { ref role, ws_idx: 0 }
+                if role == "ccc"
+        ));
+    }
 
     #[test]
     fn clicking_launcher_opens_global_menu() {
@@ -865,6 +981,37 @@ mod tests {
 
         assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
         assert_eq!(app.state.agent_panel_scroll, 0);
+    }
+
+    #[test]
+    fn clicking_agent_panel_new_opens_the_native_profile_form() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = true;
+
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let new_button = crate::ui::agent_panel_new_button_rect(&app.state, detail_area);
+        assert_ne!(new_button, Rect::default());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            new_button.x,
+            new_button.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::Settings);
+        assert_eq!(
+            app.state.settings.section,
+            crate::app::state::SettingsSection::Agents
+        );
+        let form = app.state.settings.agent_profile_form.as_ref().unwrap();
+        assert!(form.is_new());
+        assert_eq!(form.harness, "codex");
     }
 
     #[test]

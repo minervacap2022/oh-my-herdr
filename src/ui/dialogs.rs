@@ -35,7 +35,11 @@ pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
             },
         ],
         2,
-        3,
+        if inner.height >= 8 {
+            inner.height.saturating_sub(1)
+        } else {
+            3
+        },
     );
     (rects[0], rects[1], rects[2])
 }
@@ -45,7 +49,13 @@ pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
 /// IMEs draw their composition preview at the host terminal cursor. Without an
 /// explicit cursor the frame carries none, the client keeps the position last
 /// reported by the focused pane, and composition lands behind the dialog.
-fn render_name_input_field(app: &AppState, frame: &mut Frame, input_rect: Rect) {
+fn render_text_input_field(
+    app: &AppState,
+    frame: &mut Frame,
+    input_rect: Rect,
+    text: &str,
+    focused: bool,
+) {
     frame.render_widget(Clear, input_rect);
 
     // The text stops one column short of the field so the clamped caret always
@@ -56,7 +66,7 @@ fn render_name_input_field(app: &AppState, frame: &mut Frame, input_rect: Rect) 
         ..input_rect
     };
     frame.render_widget(
-        Paragraph::new(format!(" {}", app.name_input)).style(
+        Paragraph::new(format!(" {text}")).style(
             Style::default()
                 .fg(app.palette.text)
                 .bg(app.palette.surface0),
@@ -64,15 +74,19 @@ fn render_name_input_field(app: &AppState, frame: &mut Frame, input_rect: Rect) 
         text_rect,
     );
 
-    if input_rect.width == 0 {
+    if input_rect.width == 0 || !focused {
         return;
     }
     let caret_x = input_rect
         .x
         .saturating_add(1)
-        .saturating_add(display_width_u16(&app.name_input))
+        .saturating_add(display_width_u16(text))
         .min(input_rect.right().saturating_sub(1));
     frame.set_cursor_position((caret_x, input_rect.y));
+}
+
+fn render_name_input_field(app: &AppState, frame: &mut Frame, input_rect: Rect) {
+    render_text_input_field(app, frame, input_rect, &app.name_input, true);
 }
 
 pub(super) fn render_rename_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -87,26 +101,63 @@ pub(super) fn render_rename_overlay(app: &AppState, frame: &mut Frame, area: Rec
         _ => return,
     };
 
-    let Some(inner) = render_modal_shell(frame, area, 56, 7, &app.palette) else {
+    let creating_workspace = app.pending_workspace_create_cwd.is_some();
+    let popup_height = if creating_workspace { 10 } else { 7 };
+    let Some(inner) = render_modal_shell(frame, area, 56, popup_height, &app.palette) else {
         return;
     };
     if inner.height < 4 {
         return;
     }
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas::<5>(inner);
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        title,
+        &app.palette,
+    );
 
-    render_modal_header(frame, rows[0], title, &app.palette);
-
-    let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
-    render_name_input_field(app, frame, input_rect);
+    if creating_workspace {
+        let name_label_style = if app.workspace_create_cwd_editing {
+            Style::default().fg(app.palette.overlay0)
+        } else {
+            Style::default()
+                .fg(app.palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        let cwd_label_style = if app.workspace_create_cwd_editing {
+            Style::default()
+                .fg(app.palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        frame.render_widget(
+            Paragraph::new(" workspace name").style(name_label_style),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+        render_text_input_field(
+            app,
+            frame,
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+            &app.name_input,
+            !app.workspace_create_cwd_editing,
+        );
+        frame.render_widget(
+            Paragraph::new(" native working directory").style(cwd_label_style),
+            Rect::new(inner.x, inner.y + 3, inner.width, 1),
+        );
+        render_text_input_field(
+            app,
+            frame,
+            Rect::new(inner.x, inner.y + 4, inner.width, 1),
+            &app.workspace_create_cwd_input,
+            app.workspace_create_cwd_editing,
+        );
+    } else {
+        let input_rect = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+        render_name_input_field(app, frame, input_rect);
+    }
 
     let (save_rect, clear_rect, cancel_rect) = rename_button_rects(inner);
 

@@ -131,6 +131,7 @@ pub struct TerminalState {
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
+    live_roster_instance_id: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
     hook_report_sequences: HashMap<String, u64>,
@@ -165,6 +166,7 @@ impl TerminalState {
             terminal_title: None,
             manual_label: None,
             agent_name: None,
+            live_roster_instance_id: None,
             agent_name_owner: None,
             managed_agent: None,
             hook_report_sequences: HashMap::new(),
@@ -1897,11 +1899,13 @@ impl TerminalState {
         &mut self,
         name: String,
         kind: Agent,
+        roster_instance_id: Option<String>,
         now: Instant,
         settle_delay: Duration,
         timeout: Duration,
     ) {
         self.set_agent_name(name);
+        self.live_roster_instance_id = roster_instance_id;
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
             session_ref: None,
@@ -1932,6 +1936,10 @@ impl TerminalState {
 
     pub fn managed_agent_kind(&self) -> Option<Agent> {
         self.managed_agent.map(|managed| managed.kind)
+    }
+
+    pub fn live_roster_instance_id(&self) -> Option<&str> {
+        self.live_roster_instance_id.as_deref()
     }
 
     pub fn next_managed_agent_deadline(&self) -> Option<Instant> {
@@ -1994,7 +2002,9 @@ impl TerminalState {
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
-                if known_agent == Some(managed.kind) && self.state == AgentState::Idle {
+                if known_agent == Some(managed.kind)
+                    && matches!(self.state, AgentState::Idle | AgentState::Working)
+                {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
                         phase: ManagedAgentPhase::Active,
@@ -2028,8 +2038,14 @@ impl TerminalState {
         false
     }
 
-    pub fn restore_managed_agent(&mut self, name: String, kind: Agent) {
+    pub fn restore_managed_agent(
+        &mut self,
+        name: String,
+        kind: Agent,
+        roster_instance_id: Option<String>,
+    ) {
         self.set_agent_name(name);
+        self.live_roster_instance_id = roster_instance_id;
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
             session_ref: None,
@@ -2065,6 +2081,7 @@ impl TerminalState {
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
         self.clear_agent_name();
+        self.live_roster_instance_id = None;
     }
 
     pub fn is_agent_terminal(&self) -> bool {
@@ -2209,6 +2226,7 @@ mod tests {
         terminal.begin_managed_agent(
             "reviewer".into(),
             Agent::Pi,
+            None,
             now,
             Duration::from_millis(100),
             Duration::from_secs(1),
@@ -2219,9 +2237,6 @@ mod tests {
         assert!(!terminal.managed_agent_interactive_ready());
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false));
         assert!(terminal.managed_agent_launch_pending());
-
-        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
-        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
 
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Blocked);
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(102), false));
@@ -2246,12 +2261,33 @@ mod tests {
     }
 
     #[test]
+    fn managed_agent_working_state_becomes_interactive_after_settle_delay() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            None,
+            now,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false));
+        assert!(!terminal.managed_agent_launch_pending());
+        assert!(terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
     fn managed_agent_mismatch_and_timeout_release_name() {
         let now = Instant::now();
         let mut mismatch = test_terminal();
         mismatch.begin_managed_agent(
             "reviewer".into(),
             Agent::Pi,
+            None,
             now,
             Duration::ZERO,
             Duration::from_secs(1),
@@ -2265,6 +2301,7 @@ mod tests {
         timed_out.begin_managed_agent(
             "reviewer".into(),
             Agent::Pi,
+            None,
             now,
             Duration::from_millis(10),
             Duration::from_millis(20),
@@ -4926,6 +4963,7 @@ mod tests {
         terminal.begin_managed_agent(
             "reviewer".into(),
             Agent::OpenCode,
+            None,
             now,
             Duration::ZERO,
             Duration::from_secs(1),

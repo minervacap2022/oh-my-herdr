@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::{Arg, ArgAction, ArgGroup, Command, ValueHint};
 
 pub(super) fn command() -> Command {
-    let command = Command::new("herdr")
+    let command = Command::new(crate::config::product_name())
         .about("terminal workspace manager for AI coding agents")
         .disable_help_flag(true)
         .disable_version_flag(true)
@@ -64,13 +64,13 @@ fn configure_help(command: Command, depth: usize) -> Command {
 
 pub(super) fn print_requested_help(args: &[String]) -> std::io::Result<bool> {
     let mut stdout = std::io::stdout().lock();
-    write_requested_help(args, &mut stdout, crate::platform::begin_cli_output)
+    write_requested_help(args, &mut stdout, crate::platform::cli_output_guard)
 }
 
-fn write_requested_help(
+fn write_requested_help<T>(
     args: &[String],
     output: &mut impl Write,
-    before_write: impl FnOnce(),
+    before_write: impl FnOnce() -> T,
 ) -> std::io::Result<bool> {
     let Some(help_index) = args
         .iter()
@@ -103,7 +103,7 @@ fn write_requested_help(
     }
 
     selected.set_bin_name(path.join(" "));
-    before_write();
+    let _cli_output = before_write();
     selected.write_long_help(&mut *output)?;
     writeln!(output)?;
     Ok(true)
@@ -368,6 +368,47 @@ fn agent_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("broadcast")
+                .about("Submit the same prompt to every live replica of a role")
+                .arg(required("role", "ROLE"))
+                .arg(required("text", "TEXT")),
+        )
+        .subcommand(
+            Command::new("create")
+                .about("Create a saved native agent profile with its own AGENTS.md")
+                .override_usage(
+                    "herdr agent create <ROLE> --harness <codex|pi|claude> --cwd <DIR> [--instructions-file <PATH>]",
+                )
+                .arg(required("role", "ROLE"))
+                .arg(
+                    option("harness", "HARNESS")
+                        .required(true)
+                        .value_parser(["codex", "pi", "claude"])
+                        .help("Native interactive harness for this profile"),
+                )
+                .arg(path_option("cwd", "DIR").required(true))
+                .arg(path_option("instructions-file", "PATH"))
+                .after_help(
+                    "Herdr creates a session-owned AGENTS.md for this profile and injects it into the selected harness. The response includes its exact path; edit that file to change this agent's persistent instructions.",
+                ),
+        )
+        .subcommand(
+            Command::new("profile")
+                .about("Show one saved agent profile and its AGENTS.md path")
+                .arg(required("role", "ROLE")),
+        )
+        .subcommand(Command::new("profiles").about("List saved agent profiles"))
+        .subcommand(Command::new("roster").about("List persistent agent instances, including archived ones"))
+        .subcommand(
+            Command::new("revive")
+                .about("Revive one archived persistent agent instance exactly")
+                .override_usage("herdr agent revive <INSTANCE_ID> [--tab TAB] [--cwd <tab|agent>] [--timeout MS]")
+                .arg(required("instance_id", "INSTANCE_ID"))
+                .arg(option("tab", "TAB"))
+                .arg(option("cwd", "MODE").value_parser(["tab", "agent"]))
+                .arg(option("timeout", "MS")),
+        )
+        .subcommand(
             Command::new("rename")
                 .about("Rename an agent")
                 .override_usage("herdr agent rename <TARGET> <NAME>|--clear")
@@ -424,7 +465,7 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     option("timeout", "MS")
-                        .help("Wait for interactive readiness (default: 30000; max: 300000)"),
+                        .help("Managed startup deadline (default: 30000; max: 300000)"),
                 )
                 .arg(
                     Arg::new("agent_args")
@@ -434,6 +475,38 @@ fn agent_command() -> Command {
                 )
                 .after_help(
                     "The pane must be at its interactive shell prompt. Success means the expected agent was detected in the same terminal and is ready for input.\n\nnext: herdr agent prompt <TARGET> <TEXT> --wait",
+                ),
+        )
+        .subcommand(
+            Command::new("spawn")
+                .about("Spawn a saved agent profile into a fresh or auto-split pane")
+                .override_usage(
+                    "herdr agent spawn <ROLE> [--kind <KIND>] [--tab TAB] [--cwd <tab|agent>] [OPTIONS] [-- [AGENT_ARG]...]",
+                )
+                .arg(required("role", "ROLE"))
+                .arg(
+                    option("kind", "KIND")
+                        .value_parser(agent_kind_values())
+                        .help("Explicit kind override (default: saved profile harness)"),
+                )
+                .arg(option("tab", "TAB").help("Target tab (default: active tab)"))
+                .arg(
+                    option("cwd", "MODE")
+                        .value_parser(["tab", "agent"])
+                        .help("Working directory: the tab's (default) or the profile's own"),
+                )
+                .arg(
+                    option("timeout", "MS")
+                        .help("Post-submission detection deadline (default: 30000; max: 300000)"),
+                )
+                .arg(
+                    Arg::new("agent_args")
+                        .value_name("AGENT_ARG")
+                        .num_args(0..)
+                        .last(true),
+                )
+                .after_help(
+                    "herdr creates or reuses a saved profile for the role, then starts the agent in the selected tab (or the active tab by default), auto-splitting a new pane when that tab has no available shell. An existing shell is used immediately; after an auto-split, Herdr waits up to 2 seconds for the new shell prompt before submitting the command. If it does not become ready, Herdr rolls back the pane and returns agent_spawn_failed. The response then confirms command submission and may report launch_pending while detection settles. The --cwd option picks the tab's directory (default) or the profile's own native directory.\n\nnext: herdr agent wait <TARGET> --until idle",
                 ),
         )
         .subcommand(

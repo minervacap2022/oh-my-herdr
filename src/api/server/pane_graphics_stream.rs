@@ -629,17 +629,29 @@ mod tests {
 
     static NEXT_LOCAL_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-    fn local_stream_pair(_name: &str) -> (LocalStream, LocalStream, PathBuf) {
+    struct TestSocketPath(PathBuf);
+
+    impl Drop for TestSocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn local_stream_pair(_name: &str) -> (LocalStream, LocalStream, TestSocketPath) {
         let unique = format!(
             "hpg-{}-{}.sock",
             std::process::id(),
             NEXT_LOCAL_STREAM_ID.fetch_add(1, Ordering::Relaxed)
         );
         let path = std::env::temp_dir().join(unique);
+        crate::ipc::prepare_socket_path(&path, |path| {
+            format!("test socket is unexpectedly active: {}", path.display())
+        })
+        .unwrap();
         let listener = crate::ipc::bind_local_listener(&path).unwrap();
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
-        (client, server, path)
+        (client, server, TestSocketPath(path))
     }
 
     fn read_response_line(stream: &mut LocalStream) -> String {

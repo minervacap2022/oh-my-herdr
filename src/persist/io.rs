@@ -46,6 +46,14 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
 }
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+    save_json_to_path_with_replace(path, snapshot, crate::platform::replace_file)
+}
+
+fn save_json_to_path_with_replace<T: serde::Serialize>(
+    path: &Path,
+    snapshot: &T,
+    replace_file: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -53,7 +61,7 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
     let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
     std::fs::write(&tmp_path, &json)?;
-    if let Err(err) = std::fs::rename(&tmp_path, &target) {
+    if let Err(err) = replace_file(&tmp_path, &target) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
@@ -83,24 +91,33 @@ pub(super) fn clear_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
-pub fn save(snapshot: &SessionSnapshot, history: Option<&SessionHistorySnapshot>) {
+pub fn save(
+    snapshot: &SessionSnapshot,
+    history: Option<&SessionHistorySnapshot>,
+) -> std::io::Result<()> {
     let path = session_path();
     let history_path = session_history_path();
     if let Err(err) = save_to_paths(&path, &history_path, snapshot, history) {
         crate::logging::session_save_failed(&path, &err.to_string());
-        return;
+        return Err(err);
     }
     crate::logging::session_saved(&path, snapshot.workspaces.len());
+    Ok(())
 }
 
-pub fn clear() {
+pub fn clear() -> std::io::Result<()> {
     let path = session_path();
     if let Err(err) = clear_path(&path) {
         crate::logging::session_clear_failed(&path, &err.to_string());
-        return;
+        return Err(err);
     }
-    clear_history();
+    let history_path = session_history_path();
+    if let Err(err) = clear_path(&history_path) {
+        crate::logging::session_clear_failed(&history_path, &err.to_string());
+        return Err(err);
+    }
     crate::logging::session_cleared(&path);
+    Ok(())
 }
 
 pub fn clear_history() {
@@ -261,6 +278,24 @@ mod tests {
 
         assert!(session_path.exists());
         assert!(!history_path.exists());
+    }
+
+    #[test]
+    fn failed_session_replacement_preserves_existing_snapshot() {
+        let path = temp_session_path("replace-failure");
+        save_to_path(&path, &empty_snapshot()).unwrap();
+        let existing = std::fs::read_to_string(&path).unwrap();
+        let mut updated = empty_snapshot();
+        updated.selected = 7;
+
+        let err = save_json_to_path_with_replace(&path, &updated, |_, _| {
+            Err(std::io::Error::other("forced replacement failure"))
+        })
+        .expect_err("replacement failure should propagate");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]

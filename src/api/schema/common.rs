@@ -22,6 +22,16 @@ pub(super) fn metadata_token_values_schema(
     })
 }
 
+pub(super) fn agent_cwd_mode_schema(
+    _generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["tab", "agent"],
+        "default": "tab"
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct EmptyParams {}
 

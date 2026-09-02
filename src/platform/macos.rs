@@ -60,6 +60,31 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     super::interactive_unix_shell_command(argv, shell_name, shell_quote)
 }
 
+pub(crate) fn interactive_shell_command_in_cwd(
+    argv: &[String],
+    shell_name: &str,
+    cwd: &Path,
+) -> Option<String> {
+    super::interactive_unix_shell_command_in_cwd(argv, shell_name, cwd, shell_quote)
+}
+
+pub(crate) fn interactive_shell_command_with_env_in_cwd(
+    argv: &[String],
+    shell_name: &str,
+    cwd: &Path,
+    target_env: &str,
+    source_env: &str,
+) -> Option<String> {
+    super::interactive_unix_shell_command_with_env_in_cwd(
+        argv,
+        shell_name,
+        cwd,
+        target_env,
+        source_env,
+        shell_quote,
+    )
+}
+
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.chars().all(|ch| {
@@ -912,19 +937,23 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])))
 }
 
-pub fn session_processes(child_pid: u32) -> Vec<u32> {
-    if child_pid == 0 {
-        return Vec::new();
+pub fn process_session_id(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
     }
 
-    let target_session = unsafe { libc::getsid(child_pid as libc::c_int) };
-    if target_session <= 0 {
+    let session_id = unsafe { libc::getsid(pid as libc::c_int) };
+    (session_id > 0).then_some(session_id as u32)
+}
+
+pub fn session_processes(session_id: u32) -> Vec<u32> {
+    if session_id == 0 {
         return Vec::new();
     }
 
     all_pids()
         .into_iter()
-        .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == target_session)
+        .filter(|pid| process_session_id(*pid) == Some(session_id))
         .collect()
 }
 
@@ -998,6 +1027,17 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_session_id_enumerates_current_process_session() {
+        let process = std::process::id();
+        let session_id = process_session_id(process);
+        assert!(
+            session_id.is_some(),
+            "current process should have a session ID"
+        );
+        assert!(session_processes(session_id.unwrap()).contains(&process));
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

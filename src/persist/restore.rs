@@ -123,11 +123,26 @@ pub fn handoff_pane_aliases(
     workspaces: &[Workspace],
 ) -> HashMap<u32, PaneId> {
     let mut aliases = HashMap::new();
-    for (ws_snap, workspace) in snapshot.workspaces.iter().zip(workspaces) {
-        for (tab_snap, tab) in ws_snap.tabs.iter().zip(&workspace.tabs) {
-            let old_ids = collect_snapshot_pane_ids(&tab_snap.layout);
+    let mut restored_workspaces = workspaces.iter();
+    let mut seen_old_pane_ids = HashSet::new();
+    for ws_snap in &snapshot.workspaces {
+        let restored_tab_ids: Vec<_> = ws_snap
+            .tabs
+            .iter()
+            .map(|tab_snap| {
+                collect_unique_snapshot_pane_ids(&tab_snap.layout, &mut seen_old_pane_ids)
+            })
+            .filter(|old_ids| !old_ids.is_empty())
+            .collect();
+        if restored_tab_ids.is_empty() {
+            continue;
+        }
+        let Some(workspace) = restored_workspaces.next() else {
+            break;
+        };
+        for (old_ids, tab) in restored_tab_ids.iter().zip(&workspace.tabs) {
             let new_ids = tab.layout.pane_ids();
-            for (old_id, new_id) in old_ids.into_iter().zip(new_ids) {
+            for (&old_id, new_id) in old_ids.iter().zip(new_ids) {
                 if old_id != new_id.raw() {
                     aliases.insert(old_id, new_id);
                 }
@@ -138,19 +153,27 @@ pub fn handoff_pane_aliases(
 }
 
 #[cfg(unix)]
-fn collect_snapshot_pane_ids(node: &LayoutSnapshot) -> Vec<u32> {
+fn collect_unique_snapshot_pane_ids(
+    node: &LayoutSnapshot,
+    seen_old_pane_ids: &mut HashSet<u32>,
+) -> Vec<u32> {
     let mut ids = Vec::new();
-    collect_snapshot_ids_inner(node, &mut ids);
+    collect_unique_snapshot_ids_inner(node, seen_old_pane_ids, &mut ids);
     ids
 }
 
 #[cfg(unix)]
-fn collect_snapshot_ids_inner(node: &LayoutSnapshot, ids: &mut Vec<u32>) {
+fn collect_unique_snapshot_ids_inner(
+    node: &LayoutSnapshot,
+    seen_old_pane_ids: &mut HashSet<u32>,
+    ids: &mut Vec<u32>,
+) {
     match node {
-        LayoutSnapshot::Pane(id) => ids.push(*id),
+        LayoutSnapshot::Pane(id) if seen_old_pane_ids.insert(*id) => ids.push(*id),
+        LayoutSnapshot::Pane(_) => {}
         LayoutSnapshot::Split { first, second, .. } => {
-            collect_snapshot_ids_inner(first, ids);
-            collect_snapshot_ids_inner(second, ids);
+            collect_unique_snapshot_ids_inner(first, seen_old_pane_ids, ids);
+            collect_unique_snapshot_ids_inner(second, seen_old_pane_ids, ids);
         }
     }
 }
@@ -271,6 +294,7 @@ fn restore_with_imports_and_failures(
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
+    let mut restored_old_pane_ids = HashSet::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
@@ -289,6 +313,7 @@ fn restore_with_imports_and_failures(
             &runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
+            &mut restored_old_pane_ids,
         );
         failed_imports += workspace_failed_imports;
         if let Some((workspace, restored_terminals, restored_runtimes)) = restored {
@@ -311,6 +336,7 @@ fn restore_workspace(
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    restored_old_pane_ids: &mut HashSet<u32>,
 ) -> RestoreFailures<Option<RestoredWorkspace>> {
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
@@ -366,6 +392,7 @@ fn restore_workspace(
             resumed_agent_sessions,
             imported_panes,
             &public_pane_ids_by_old_raw,
+            restored_old_pane_ids,
         );
         failed_imports += tab_failed_imports;
         let Some((mut tab, restored_terminals, restored_runtimes, reverse_id_map)) = restored_tab
@@ -454,8 +481,12 @@ fn restore_tab(
     resumed_agent_sessions: &mut HashSet<String>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
+    restored_old_pane_ids: &mut HashSet<u32>,
 ) -> RestoreFailures<Option<RestoredTab>> {
-    let (node, id_map) = restore_node_remapped(&snap.layout);
+    let (node, id_map) = restore_node_remapped(&snap.layout, restored_old_pane_ids);
+    let Some(node) = node else {
+        return (None, 0);
+    };
     let reverse_id_map: HashMap<PaneId, u32> = id_map
         .iter()
         .map(|(&old_id, &new_id)| (new_id, old_id))
@@ -492,6 +523,8 @@ fn restore_tab(
 
         let saved_label = saved_pane.and_then(|p| p.label.clone());
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
+        let saved_agent_roster_instance_id =
+            saved_pane.and_then(|pane| pane.agent_roster_instance_id.clone());
         let saved_managed_agent = saved_pane
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
@@ -544,9 +577,11 @@ fn restore_tab(
                 terminal.set_persisted_agent_session(session);
             }
             match (saved_agent_name, saved_managed_agent) {
-                (Some(agent_name), Some(agent)) => {
-                    terminal.restore_managed_agent(agent_name, agent)
-                }
+                (Some(agent_name), Some(agent)) => terminal.restore_managed_agent(
+                    agent_name,
+                    agent,
+                    saved_agent_roster_instance_id.clone(),
+                ),
                 (Some(_), None) => {}
                 (None, _) => {}
             }
@@ -641,9 +676,8 @@ fn restore_tab(
                     terminal.set_persisted_agent_session(session);
                 }
                 match (saved_agent_name, saved_managed_agent) {
-                    (Some(agent_name), Some(agent)) if was_imported => {
-                        terminal.restore_managed_agent(agent_name, agent)
-                    }
+                    (Some(agent_name), Some(agent)) if was_imported => terminal
+                        .restore_managed_agent(agent_name, agent, saved_agent_roster_instance_id),
                     (Some(_), Some(_)) => {}
                     (Some(agent_name), None) if was_imported => terminal.set_agent_name(agent_name),
                     (Some(_), None) => {}
@@ -861,19 +895,33 @@ pub(super) fn resolve_restored_pane(
 }
 
 /// Restore a layout tree, remapping every pane ID to a fresh globally unique one.
-/// Returns the new tree and a map of old_raw_id → new PaneId.
-pub(super) fn restore_node_remapped(snap: &LayoutSnapshot) -> (Node, HashMap<u32, PaneId>) {
+/// Duplicate saved pane IDs are discarded after their first preorder occurrence.
+pub(super) fn restore_node_remapped(
+    snap: &LayoutSnapshot,
+    restored_old_pane_ids: &mut HashSet<u32>,
+) -> (Option<Node>, HashMap<u32, PaneId>) {
     let mut id_map = HashMap::new();
-    let node = remap_inner(snap, &mut id_map);
+    let node = remap_inner(snap, restored_old_pane_ids, &mut id_map);
     (node, id_map)
 }
 
-fn remap_inner(snap: &LayoutSnapshot, id_map: &mut HashMap<u32, PaneId>) -> Node {
+fn remap_inner(
+    snap: &LayoutSnapshot,
+    restored_old_pane_ids: &mut HashSet<u32>,
+    id_map: &mut HashMap<u32, PaneId>,
+) -> Option<Node> {
     match snap {
         LayoutSnapshot::Pane(old_id) => {
+            if !restored_old_pane_ids.insert(*old_id) {
+                warn!(
+                    pane_id = old_id,
+                    "discarding duplicate saved pane ID during restore"
+                );
+                return None;
+            }
             let new_id = PaneId::alloc();
             id_map.insert(*old_id, new_id);
-            Node::Pane(new_id)
+            Some(Node::Pane(new_id))
         }
         LayoutSnapshot::Split {
             direction,
@@ -881,17 +929,21 @@ fn remap_inner(snap: &LayoutSnapshot, id_map: &mut HashMap<u32, PaneId>) -> Node
             first,
             second,
         } => {
-            let first_node = remap_inner(first, id_map);
-            let second_node = remap_inner(second, id_map);
+            let first_node = remap_inner(first, restored_old_pane_ids, id_map);
+            let second_node = remap_inner(second, restored_old_pane_ids, id_map);
             let dir = match direction {
                 DirectionSnapshot::Horizontal => Direction::Horizontal,
                 DirectionSnapshot::Vertical => Direction::Vertical,
             };
-            Node::Split {
-                direction: dir,
-                ratio: *ratio,
-                first: Box::new(first_node),
-                second: Box::new(second_node),
+            match (first_node, second_node) {
+                (Some(first), Some(second)) => Some(Node::Split {
+                    direction: dir,
+                    ratio: *ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(node), None) | (None, Some(node)) => Some(node),
+                (None, None) => None,
             }
         }
     }
@@ -950,13 +1002,33 @@ mod tests {
         };
 
         let snap = super::super::snapshot::capture_node(&node);
-        let (restored, id_map) = restore_node_remapped(&snap);
+        let mut restored_old_pane_ids = HashSet::new();
+        let (restored, id_map) = restore_node_remapped(&snap, &mut restored_old_pane_ids);
+        let restored = restored.expect("unique pane IDs should restore a layout");
 
         assert_eq!(id_map.len(), 3);
         let ids = collect_pane_ids(&restored);
         assert_eq!(ids.len(), 3);
         let unique: std::collections::HashSet<u32> = ids.iter().map(|id| id.raw()).collect();
         assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn restore_node_remapped_discards_later_duplicate_leaf() {
+        let snap = LayoutSnapshot::Split {
+            direction: DirectionSnapshot::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutSnapshot::Pane(7)),
+            second: Box::new(LayoutSnapshot::Pane(7)),
+        };
+        let mut restored_old_pane_ids = HashSet::new();
+
+        let (restored, id_map) = restore_node_remapped(&snap, &mut restored_old_pane_ids);
+        let restored = restored.expect("the first duplicate leaf should survive");
+
+        assert_eq!(collect_pane_ids(&restored).len(), 1);
+        assert_eq!(id_map.len(), 1);
+        assert!(id_map.contains_key(&7));
     }
 
     #[test]
@@ -1190,6 +1262,7 @@ mod tests {
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
+                            agent_roster_instance_id: Some("reviewer-instance-1".into()),
                             managed_agent_kind: Some("opencode".into()),
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "herdr:opencode".into(),
@@ -1237,6 +1310,7 @@ mod tests {
             "agent sessions should not use native restore lifecycle when resume_agents_on_restore is disabled"
         );
         assert_eq!(terminal.agent_name, None);
+        assert_eq!(terminal.live_roster_instance_id(), None);
         assert_eq!(terminal.manual_label.as_deref(), Some("reviewer"));
         let session = terminal
             .persisted_agent_session
@@ -1276,6 +1350,7 @@ mod tests {
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
+                                agent_roster_instance_id: None,
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
@@ -1287,6 +1362,7 @@ mod tests {
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
+                                agent_roster_instance_id: None,
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
@@ -1330,6 +1406,104 @@ mod tests {
         assert_eq!(workspace.next_public_tab_number, 6);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_discards_global_duplicate_pane_ids_and_keeps_handoff_aliases_aligned() {
+        let cwd = std::env::current_dir().unwrap();
+        let duplicate_id = 10_000_010;
+        let unique_id = 10_000_020;
+        let pane = |label: &str| super::super::snapshot::PaneSnapshot {
+            cwd: cwd.clone(),
+            label: Some(label.into()),
+            agent_name: None,
+            agent_roster_instance_id: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            launch_argv: None,
+        };
+        let tab = |id, label| TabSnapshot {
+            custom_name: None,
+            layout: LayoutSnapshot::Pane(id),
+            panes: HashMap::from([(id, pane(label))]),
+            zoomed: false,
+            focused: Some(id),
+            root_pane: Some(id),
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![
+                WorkspaceSnapshot {
+                    id: Some("w1".into()),
+                    custom_name: None,
+                    identity_cwd: cwd.clone(),
+                    worktree_space: None,
+                    public_pane_numbers: HashMap::from([(duplicate_id, 1)]),
+                    next_public_pane_number: 2,
+                    public_tab_numbers: vec![1],
+                    next_public_tab_number: 2,
+                    tabs: vec![tab(duplicate_id, "first")],
+                    active_tab: 0,
+                },
+                WorkspaceSnapshot {
+                    id: Some("w2".into()),
+                    custom_name: None,
+                    identity_cwd: cwd.clone(),
+                    worktree_space: None,
+                    public_pane_numbers: HashMap::from([(duplicate_id, 4), (unique_id, 5)]),
+                    next_public_pane_number: 6,
+                    public_tab_numbers: vec![1, 2],
+                    next_public_tab_number: 3,
+                    tabs: vec![tab(duplicate_id, "duplicate"), tab(unique_id, "unique")],
+                    active_tab: 0,
+                },
+            ],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        assert_eq!(workspaces.len(), 2);
+        let labels: Vec<_> = workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .map(|tab| {
+                let terminal_id = &tab
+                    .panes
+                    .get(&tab.root_pane)
+                    .expect("root pane should restore")
+                    .attached_terminal_id;
+                terminals
+                    .get(terminal_id)
+                    .and_then(|terminal| terminal.manual_label.clone())
+            })
+            .collect();
+        assert_eq!(labels, vec![Some("first".into()), Some("unique".into())]);
+
+        let first = workspaces[0].tabs[0].root_pane;
+        let unique = workspaces[1].tabs[0].root_pane;
+        assert_eq!(
+            handoff_pane_aliases(&snapshot, &workspaces),
+            HashMap::from([(duplicate_id, first), (unique_id, unique)])
+        );
+    }
+
     #[tokio::test]
     async fn cold_restore_with_gapped_public_tab_numbers_drops_unmanaged_agent_name() {
         let cwd = std::env::current_dir().unwrap();
@@ -1340,6 +1514,7 @@ mod tests {
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
+                    agent_roster_instance_id: None,
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
@@ -1350,6 +1525,7 @@ mod tests {
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
+            agent_roster_instance_id: None,
             managed_agent_kind: None,
             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                 source: "herdr:codex".into(),
@@ -1500,8 +1676,9 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             cwd,
                             label: None,
-                            agent_name: None,
-                            managed_agent_kind: None,
+                            agent_name: Some("reviewer".into()),
+                            agent_roster_instance_id: Some("reviewer-instance-1".into()),
+                            managed_agent_kind: Some("codex".into()),
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "herdr:codex".into(),
                                 agent: "codex".into(),
@@ -1551,6 +1728,11 @@ mod tests {
             !terminal.respawn_shell_on_exit,
             "deferred agent resume should not use native restore lifecycle before launch"
         );
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(
+            terminal.live_roster_instance_id(),
+            Some("reviewer-instance-1")
+        );
         assert!(
             runtimes.is_empty(),
             "native agent restore should not spawn a fallback-size runtime during snapshot restore"
@@ -1574,6 +1756,11 @@ mod tests {
         assert!(
             handoff_terminal.pending_agent_resume_plan.is_some(),
             "handoff restore should preserve pending native agent resume intent"
+        );
+        assert_eq!(handoff_terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(
+            handoff_terminal.live_roster_instance_id(),
+            Some("reviewer-instance-1")
         );
         assert!(
             handoff_runtimes.is_empty(),
@@ -1667,6 +1854,7 @@ mod tests {
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,
+                agent_roster_instance_id: None,
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,

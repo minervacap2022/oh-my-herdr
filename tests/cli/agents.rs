@@ -48,8 +48,7 @@ fn write_delayed_shell_and_fake_pi(
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$HERDR_PANE_ID\" --source custom:delayed-shell-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r _prompt; do :; done\n",
-            invocations.display(),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> pi-invocations\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$HERDR_PANE_ID\" --source custom:delayed-shell-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r _prompt; do :; done\n",
             env!("CARGO_BIN_EXE_herdr"),
         ),
     )
@@ -136,6 +135,473 @@ fn agent_start_waits_for_a_new_pane_shell_to_finish_initializing() {
             .unwrap()["focused"],
         true
     );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_spawn_assigns_a_replica_and_auto_splits_for_a_running_role() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, _delayed_shell, _invocations) = write_delayed_shell_and_fake_pi(&base, "0");
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let root_pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let first = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert_eq!(first["result"]["type"], "agent_spawned");
+    assert_eq!(first["result"]["spawned"]["name"], "reviewer");
+    assert_eq!(first["result"]["spawned"]["pane_id"], root_pane_id);
+    assert_eq!(first["result"]["spawned"]["split"], false);
+
+    let second = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert_eq!(second["result"]["type"], "agent_spawned");
+    assert_eq!(second["result"]["spawned"]["name"], "reviewer-replica-1");
+    assert_eq!(second["result"]["spawned"]["split"], true);
+    assert_ne!(second["result"]["spawned"]["pane_id"], root_pane_id);
+
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 2);
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_spawn_waits_for_a_new_root_shell_without_splitting() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "0.4");
+    let config = format!(
+        "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
+        delayed_shell.to_str().unwrap()
+    );
+    let herdr = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(&bin),
+        &config,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let root_pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+
+    let started_at = Instant::now();
+    let spawned = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    assert_eq!(spawned["result"]["spawned"]["pane_id"], root_pane_id);
+    assert_eq!(spawned["result"]["spawned"]["split"], false);
+    assert!(started_at.elapsed() >= Duration::from_millis(300));
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(fs::read_to_string(&invocations).unwrap().lines().count(), 1);
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_spawn_auto_splits_a_root_pane_with_visible_command_output() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "0");
+    let config = format!(
+        "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
+        delayed_shell.to_str().unwrap()
+    );
+    let herdr = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(&bin),
+        &config,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let root_pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::thread::sleep(Duration::from_millis(100));
+    let running = run_cli(
+        &socket_path,
+        &["pane", "run", &root_pane_id, "printf busy; sleep 3"],
+    );
+    assert!(
+        running.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started_at = Instant::now();
+    let spawned = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    assert_eq!(spawned["result"]["type"], "agent_spawned");
+    assert_ne!(spawned["result"]["spawned"]["pane_id"], root_pane_id);
+    assert_eq!(spawned["result"]["spawned"]["split"], true);
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 2);
+    assert_eq!(fs::read_to_string(&invocations).unwrap().lines().count(), 1);
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_spawn_waits_for_an_auto_split_shell_to_become_ready() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "0.4");
+    let config = format!(
+        "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
+        delayed_shell.to_str().unwrap()
+    );
+    let herdr = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(&bin),
+        &config,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    let started_at = Instant::now();
+    let spawned = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    assert_eq!(spawned["result"]["type"], "agent_spawned");
+    assert_eq!(spawned["result"]["spawned"]["name"], "reviewer-replica-1");
+    assert_eq!(spawned["result"]["spawned"]["split"], true);
+    assert!(started_at.elapsed() >= Duration::from_millis(300));
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 2);
+    assert_eq!(fs::read_to_string(&invocations).unwrap().lines().count(), 2);
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_spawn_rolls_back_an_auto_split_when_the_shell_never_becomes_ready() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, delayed_shell, _invocations) = write_delayed_shell_and_fake_pi(&base, "2.3");
+    let config = format!(
+        "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
+        delayed_shell.to_str().unwrap()
+    );
+    let herdr = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(&bin),
+        &config,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    std::thread::sleep(Duration::from_millis(2400));
+    run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    let started_at = Instant::now();
+    let failed = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    assert_eq!(failed.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_spawn_failed");
+    assert!(started_at.elapsed() >= Duration::from_secs(2));
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 1);
+    let registry_path = config_home.join(app_dir_name()).join("agents.json");
+    let registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(registry_path).unwrap()).unwrap();
+    assert_eq!(registry["profiles"]["reviewer"]["replicas_assigned"], 0);
+    let roster = registry["roster"].as_object().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(
+        roster.values().next().unwrap()["display_name"],
+        serde_json::json!("reviewer")
+    );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_spawn_reserves_distinct_replica_names_for_concurrent_auto_splits() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "0.4");
+    let config = format!(
+        "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
+        delayed_shell.to_str().unwrap()
+    );
+    let herdr = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(&bin),
+        &config,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let first_socket_path = socket_path.clone();
+    let second_socket_path = socket_path.clone();
+    let (first, second) = std::thread::scope(|scope| {
+        let first_barrier = barrier.clone();
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            run_cli(
+                &first_socket_path,
+                &[
+                    "agent",
+                    "spawn",
+                    "reviewer",
+                    "--kind",
+                    "pi",
+                    "--timeout",
+                    "5000",
+                ],
+            )
+        });
+        let second_barrier = barrier.clone();
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            run_cli(
+                &second_socket_path,
+                &[
+                    "agent",
+                    "spawn",
+                    "reviewer",
+                    "--kind",
+                    "pi",
+                    "--timeout",
+                    "5000",
+                ],
+            )
+        });
+        barrier.wait();
+        (first.join().unwrap(), second.join().unwrap())
+    });
+
+    assert!(
+        first.status.success(),
+        "first concurrent spawn failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second concurrent spawn failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let mut names = [
+        serde_json::from_slice::<serde_json::Value>(&first.stdout).unwrap()["result"]["spawned"]
+            ["name"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        serde_json::from_slice::<serde_json::Value>(&second.stdout).unwrap()["result"]["spawned"]
+            ["name"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ];
+    names.sort();
+    assert_eq!(names, ["reviewer-replica-1", "reviewer-replica-2"]);
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 3);
+    assert_eq!(fs::read_to_string(&invocations).unwrap().lines().count(), 3);
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn invalid_agent_spawn_does_not_leave_an_orphaned_split_pane() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let (bin, _delayed_shell, _invocations) = write_delayed_shell_and_fake_pi(&base, "0");
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    let invalid = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "spawn",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--timeout",
+            "3000",
+        ],
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_agent_timeout");
+
+    let panes = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 1);
 
     cleanup_spawned_herdr(herdr, base);
 }

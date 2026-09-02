@@ -27,6 +27,18 @@ enum RuntimeExitAction {
     ClosePane,
 }
 
+fn registry_agent_status(
+    status: crate::api::schema::AgentStatus,
+) -> crate::agent_registry::AgentStatus {
+    match status {
+        crate::api::schema::AgentStatus::Idle => crate::agent_registry::AgentStatus::Idle,
+        crate::api::schema::AgentStatus::Working => crate::agent_registry::AgentStatus::Working,
+        crate::api::schema::AgentStatus::Blocked => crate::agent_registry::AgentStatus::Blocked,
+        crate::api::schema::AgentStatus::Done => crate::agent_registry::AgentStatus::Done,
+        crate::api::schema::AgentStatus::Unknown => crate::agent_registry::AgentStatus::Unknown,
+    }
+}
+
 impl App {
     pub(crate) fn dispatch_api_request(
         &mut self,
@@ -177,6 +189,7 @@ impl App {
         {
             self.state.plugin_commands_in_flight =
                 self.state.plugin_commands_in_flight.saturating_sub(1);
+            self.release_plugin_command_root_lease(&log_id);
             if let Some(log) = self
                 .state
                 .plugin_command_logs
@@ -610,7 +623,24 @@ impl App {
     }
 
     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
-        let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
+        let public_pane_id = self.public_pane_id(update.ws_idx, update.pane_id);
+        if update.agent_released {
+            let terminated = self.terminate_live_roster_instance(
+                update.released_roster_instance_id.as_deref(),
+                update.released_agent_name.as_deref(),
+            );
+            if !terminated && update.released_roster_instance_id.is_none() {
+                if let Some(pane_id) = public_pane_id.as_deref() {
+                    if let Err(err) = self.update_agent_registry(|registry| {
+                        registry.roster_terminate_for_pane(pane_id)
+                    }) {
+                        tracing::warn!(err = %err, pane_id, "failed to persist terminated agent roster entry");
+                    }
+                }
+            }
+        }
+
+        let Some(pane_id) = public_pane_id else {
             return;
         };
         let workspace_id = self.public_workspace_id(update.ws_idx);
@@ -640,6 +670,28 @@ impl App {
             .and_then(|ws| ws.pane_state(update.pane_id))
             .map(|pane| pane_agent_status(update.state, pane.seen))
             .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
+
+        if !update.agent_released {
+            if let Some(instance_id) = update.roster_instance_id.as_deref() {
+                if let Err(err) = self.update_agent_registry(|registry| {
+                    registry.roster_update_status_instance(
+                        instance_id,
+                        registry_agent_status(agent_status),
+                    )
+                }) {
+                    tracing::warn!(err = %err, instance_id, "failed to persist agent roster status");
+                }
+            } else {
+                if let Err(err) = self.update_agent_registry(|registry| {
+                    registry.roster_update_status_for_pane(
+                        &pane_id,
+                        registry_agent_status(agent_status),
+                    )
+                }) {
+                    tracing::warn!(err = %err, pane_id, "failed to persist agent roster status");
+                }
+            }
+        }
 
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
@@ -1067,7 +1119,26 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentSpawn(params) => return self.handle_agent_spawn(request.id, params),
+            Method::AgentRevive(params) => return self.handle_agent_revive(request.id, params),
+            Method::AgentRosterList(_) => return self.handle_agent_roster_list(request.id),
+            Method::AgentProfileCreate(params) => {
+                return self.handle_agent_profile_create(request.id, params)
+            }
+            Method::AgentProfileSetMd(params) => {
+                return self.handle_agent_profile_set_md(request.id, params)
+            }
+            Method::AgentProfileGet(params) => {
+                return self.handle_agent_profile_get(request.id, params)
+            }
+            Method::AgentProfileList(_) => return self.handle_agent_profile_list(request.id),
+            Method::AgentProfileSet(params) => {
+                return self.handle_agent_profile_set(request.id, params)
+            }
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
+            Method::AgentBroadcast(params) => {
+                return self.handle_agent_broadcast(request.id, params)
+            }
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,
@@ -1970,6 +2041,13 @@ mod tests {
             terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
             if let Some(agent_name) = agent_name {
                 terminal.set_agent_name(agent_name.into());
+                app.agent_registry.roster_register(
+                    agent_name,
+                    agent_name,
+                    agent_name,
+                    "",
+                    Some(app.public_pane_id(0, pane_id).unwrap()),
+                );
             }
 
             app.handle_internal_event(AppEvent::StateChanged {
@@ -1991,6 +2069,16 @@ mod tests {
                     ..
                 }
             )));
+            if let Some(agent_name) = agent_name {
+                assert_eq!(
+                    app.agent_registry
+                        .roster
+                        .values()
+                        .find(|entry| entry.display_name == agent_name)
+                        .map(|entry| entry.status),
+                    Some(crate::agent_registry::AgentStatus::Terminated)
+                );
+            }
         }
     }
 

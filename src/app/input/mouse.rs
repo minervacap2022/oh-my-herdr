@@ -27,6 +27,7 @@ use super::{
 
 pub(super) enum MouseAction {
     NewWorkspace,
+    NewAgentProfile,
     Settings(SettingsAction),
     FocusWorkspace {
         ws_idx: usize,
@@ -393,6 +394,20 @@ impl AppState {
                     self.mode,
                     Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane
                 ) {
+                    if self.pending_workspace_create_cwd.is_some() {
+                        if let Some(inner) = self.rename_modal_inner() {
+                            let name_input = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+                            let cwd_input = Rect::new(inner.x, inner.y + 4, inner.width, 1);
+                            if rect_contains(name_input, mouse.column, mouse.row) {
+                                self.workspace_create_cwd_editing = false;
+                                return None;
+                            }
+                            if rect_contains(cwd_input, mouse.column, mouse.row) {
+                                self.workspace_create_cwd_editing = true;
+                                return None;
+                            }
+                        }
+                    }
                     let action = self
                         .rename_modal_inner()
                         .map(crate::ui::rename_button_rects)
@@ -532,6 +547,11 @@ impl AppState {
                             return Some(MouseAction::FocusWorkspace { ws_idx: idx });
                         }
 
+                        if let Some(role) = self.collapsed_saved_agent_profile_target_at(mouse.row)
+                        {
+                            self.open_agent_profile_spawn_menu(role, mouse.column, mouse.row);
+                            return None;
+                        }
                         if let Some((ws_idx, _tab_idx, pane_id)) =
                             self.collapsed_agent_detail_target_at(mouse.row)
                         {
@@ -600,6 +620,10 @@ impl AppState {
                         return None;
                     }
 
+                    if self.on_agent_panel_new_button(mouse.column, mouse.row) {
+                        return Some(MouseAction::NewAgentProfile);
+                    }
+
                     if self.on_agent_panel_sort_toggle(mouse.column, mouse.row) {
                         self.agent_panel_sort = match self.agent_panel_sort {
                             AgentPanelSort::Spaces => AgentPanelSort::Priority,
@@ -626,6 +650,10 @@ impl AppState {
                         return None;
                     }
 
+                    if let Some(role) = self.saved_agent_profile_target_at(mouse.row) {
+                        self.open_agent_profile_spawn_menu(role, mouse.column, mouse.row);
+                        return None;
+                    }
                     if let Some((ws_idx, _tab_idx, pane_id)) =
                         self.agent_detail_target_at(mouse.row)
                     {
@@ -3637,7 +3665,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn keyboard_context_menu_split_keeps_new_runtime() {
+    async fn keyboard_context_menu_does_not_expose_manual_split() {
         let mut app = app_for_mouse_test();
         app.state.default_shell = "/usr/bin/true".into();
         let (workspace, terminal, runtime) = Workspace::new(
@@ -3682,8 +3710,8 @@ mod tests {
         );
 
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
-        assert_eq!(app.terminal_runtimes.len(), runtime_count + 1);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
+        assert_eq!(app.terminal_runtimes.len(), runtime_count);
 
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {

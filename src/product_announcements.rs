@@ -210,7 +210,7 @@ fn write_store_to_path(path: &Path, store: &AnnouncementStore) -> io::Result<()>
     let json = serde_json::to_string_pretty(store).map_err(io::Error::other)?;
     let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(&tmp_path, json)?;
-    if let Err(err) = fs::rename(&tmp_path, path) {
+    if let Err(err) = crate::platform::replace_file(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
     }

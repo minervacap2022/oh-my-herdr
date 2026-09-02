@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SendError, TrySendError};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -43,6 +43,8 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 /// Maximum encoded mouse report accepted with pixel geometry.
 const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
+pub(crate) const MAX_CONTROL_QUEUE_ITEMS: usize = 64;
+const MAX_CONTROL_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
@@ -54,8 +56,23 @@ pub(crate) struct ClientWriter {
 }
 
 impl ClientWriter {
-    pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) {
-        self.render.queue.replace_with_cleanup(data);
+    fn new(writer_queue: Arc<ClientWriterQueue>, transport: ClientTransport) -> Self {
+        Self {
+            control: ClientControlWriter::queue(writer_queue.clone(), transport.clone()),
+            render: ClientRenderWriter::queue(writer_queue, transport),
+        }
+    }
+
+    pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        let result = self.render.queue.replace_with_cleanup(data);
+        if result.is_err() {
+            self.retire();
+        }
+        result
+    }
+
+    pub(crate) fn retire(&self) {
+        self.control.retire();
     }
 
     #[cfg(test)]
@@ -65,7 +82,7 @@ impl ClientWriter {
 
     #[cfg(test)]
     pub(crate) fn test_close(&self) {
-        self.render.queue.close_writer();
+        self.retire();
     }
 
     #[cfg(test)]
@@ -75,13 +92,9 @@ impl ClientWriter {
     ) -> Self {
         let queue = ClientWriterQueue::new();
         let drain = queue.clone();
-        let control_writer = ClientControlWriter::queue(queue.clone());
-        let mut render_writer = ClientRenderWriter::queue(queue);
-        render_writer.test_render = Some(render.clone());
-        let writer = Self {
-            control: control_writer,
-            render: render_writer,
-        };
+        let transport = ClientTransport::test(queue.clone());
+        let mut writer = Self::new(queue, transport);
+        writer.render.test_render = Some(render.clone());
         std::thread::spawn(move || {
             while let Some(item) = drain.recv() {
                 let sent = match item {
@@ -96,11 +109,69 @@ impl ClientWriter {
         });
         writer
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_unread_queue() -> Self {
+        let queue = ClientWriterQueue::new();
+        Self::new(queue.clone(), ClientTransport::test(queue))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClientTransport {
+    disconnect_reported: Arc<AtomicBool>,
+    writer_queue: Arc<ClientWriterQueue>,
+    retire_stream: Option<Arc<crate::ipc::LocalStreamRetirer>>,
+}
+
+impl ClientTransport {
+    fn new(writer_queue: Arc<ClientWriterQueue>, stream: LocalStream) -> Self {
+        Self {
+            disconnect_reported: Arc::new(AtomicBool::new(false)),
+            writer_queue,
+            retire_stream: Some(Arc::new(crate::ipc::LocalStreamRetirer::new(stream))),
+        }
+    }
+
+    #[cfg(test)]
+    fn test(writer_queue: Arc<ClientWriterQueue>) -> Self {
+        Self {
+            disconnect_reported: Arc::new(AtomicBool::new(false)),
+            writer_queue,
+            retire_stream: None,
+        }
+    }
+
+    fn retire(&self) {
+        self.writer_queue.close_writer();
+        if let Some(stream) = &self.retire_stream {
+            if let Err(err) = stream.retire() {
+                debug!(err = %err, "failed to retire client transport");
+            }
+        }
+    }
+
+    fn report_disconnect(&self, client_id: u64, server_event_tx: &mpsc::Sender<ServerEvent>) {
+        if self.disconnect_reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+    }
+
+    fn retire_and_report_disconnect(
+        &self,
+        client_id: u64,
+        server_event_tx: &mpsc::Sender<ServerEvent>,
+    ) {
+        self.retire();
+        self.report_disconnect(client_id, server_event_tx);
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct ClientControlWriter {
     queue: Arc<ClientWriterQueue>,
+    transport: ClientTransport,
     #[cfg(test)]
     test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
@@ -108,6 +179,7 @@ pub(crate) struct ClientControlWriter {
 #[derive(Debug)]
 pub(crate) struct ClientRenderWriter {
     queue: Arc<ClientWriterQueue>,
+    transport: ClientTransport,
     #[cfg(test)]
     test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
@@ -119,6 +191,7 @@ macro_rules! writer_handle {
                 self.queue.add_sender();
                 Self {
                     queue: self.queue.clone(),
+                    transport: self.transport.clone(),
                     #[cfg(test)]
                     test_render: self.test_render.clone(),
                 }
@@ -135,25 +208,35 @@ writer_handle!(ClientControlWriter);
 writer_handle!(ClientRenderWriter);
 
 impl ClientControlWriter {
-    fn queue(queue: Arc<ClientWriterQueue>) -> Self {
+    fn queue(queue: Arc<ClientWriterQueue>, transport: ClientTransport) -> Self {
         queue.add_sender();
         Self {
             queue,
+            transport,
             #[cfg(test)]
             test_render: None,
         }
     }
 
-    pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
-        self.queue.send_control(data)
+    pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        let result = self.queue.send_control(data);
+        if result.is_err() {
+            self.retire();
+        }
+        result
+    }
+
+    fn retire(&self) {
+        self.transport.retire();
     }
 }
 
 impl ClientRenderWriter {
-    fn queue(queue: Arc<ClientWriterQueue>) -> Self {
+    fn queue(queue: Arc<ClientWriterQueue>, transport: ClientTransport) -> Self {
         queue.add_sender();
         Self {
             queue,
+            transport,
             #[cfg(test)]
             test_render: None,
         }
@@ -181,6 +264,7 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    control_bytes: usize,
     ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
@@ -215,14 +299,15 @@ impl ClientWriterQueue {
         self.ready.notify_one();
     }
 
-    fn send_control(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+    fn send_control(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
-        if !state.writer_alive {
-            return Err(SendError(data));
+        let result = Self::enqueue_control(&mut state, data);
+        match result {
+            Ok(()) => self.ready.notify_one(),
+            Err(TrySendError::Full(_)) => self.ready.notify_all(),
+            Err(TrySendError::Disconnected(_)) => {}
         }
-        state.control.push_back(data);
-        self.ready.notify_one();
-        Ok(())
+        result
     }
 
     fn try_send_render(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
@@ -254,20 +339,24 @@ impl ClientWriterQueue {
         Ok(())
     }
 
-    fn replace_with_cleanup(&self, data: Vec<u8>) {
+    fn replace_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
         state.render = None;
         state.ordered.clear();
-        if state.writer_alive {
-            state.control.push_back(data);
-            self.ready.notify_one();
+        let result = Self::enqueue_control(&mut state, data);
+        match result {
+            Ok(()) => self.ready.notify_one(),
+            Err(TrySendError::Full(_)) => self.ready.notify_all(),
+            Err(TrySendError::Disconnected(_)) => {}
         }
+        result
     }
 
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
             if let Some(data) = state.control.pop_front() {
+                state.control_bytes = state.control_bytes.saturating_sub(data.len());
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.ordered.pop_front() {
@@ -289,16 +378,40 @@ impl ClientWriterQueue {
 
     fn close_writer(&self) {
         let mut state = self.lock_state();
+        Self::close_state(&mut state);
+        self.ready.notify_all();
+    }
+
+    fn close_state(state: &mut ClientWriterQueueState) {
         state.writer_alive = false;
+        state.control.clear();
+        state.control_bytes = 0;
         state.render = None;
         state.ordered.clear();
-        self.ready.notify_all();
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ClientWriterQueueState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn enqueue_control(
+        state: &mut ClientWriterQueueState,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        if !state.writer_alive {
+            return Err(TrySendError::Disconnected(data));
+        }
+        if state.control.len() >= MAX_CONTROL_QUEUE_ITEMS
+            || data.len() > MAX_CONTROL_QUEUE_BYTES.saturating_sub(state.control_bytes)
+        {
+            Self::close_state(state);
+            return Err(TrySendError::Full(data));
+        }
+        state.control_bytes += data.len();
+        state.control.push_back(data);
+        Ok(())
     }
 }
 
@@ -485,31 +598,21 @@ fn input_event_limit(events: &[ClientInputEvent]) -> InputEventLimit {
     }
 }
 
-#[cfg(windows)]
-fn set_client_recv_timeout(
-    stream: &LocalStream,
-    timeout: Option<Duration>,
-    context: &'static str,
-    client_id: u64,
-) -> io::Result<()> {
-    match stream.set_recv_timeout(timeout) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-            debug!(client_id, err = %err, context, "client socket receive timeout unavailable");
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(not(windows))]
-fn set_client_recv_timeout(
-    stream: &LocalStream,
-    timeout: Option<Duration>,
-    _context: &'static str,
-    _client_id: u64,
-) -> io::Result<()> {
-    stream.set_recv_timeout(timeout)
+fn read_client_hello(
+    stream: &mut LocalStream,
+    timeout: Duration,
+) -> Result<ClientMessage, protocol::FramingError> {
+    let mut reader = crate::ipc::DeadlineLocalStreamReader::new(
+        stream,
+        std::time::Instant::now() + timeout,
+        "client handshake timed out",
+    )
+    .map_err(protocol::FramingError::Io)?;
+    let result = protocol::read_message(&mut reader, MAX_FRAME_SIZE);
+    reader
+        .restore_stream_mode()
+        .map_err(protocol::FramingError::Io)?;
+    result
 }
 
 /// Handles the client handshake on a blocking thread.
@@ -530,15 +633,9 @@ pub(crate) fn handle_client_handshake(
     // the handshake thread needs blocking I/O for read_message/write_message.
     stream.set_nonblocking(false)?;
 
-    set_client_recv_timeout(
-        &stream,
-        Some(HANDSHAKE_TIMEOUT),
-        "client handshake read timeout unavailable",
-        client_id,
-    )?;
-
     // Read the Hello message.
-    let hello: ClientMessage = match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
+    let hello = read_client_hello(&mut stream, HANDSHAKE_TIMEOUT);
+    let hello: ClientMessage = match hello {
         Ok(msg) => msg,
         Err(protocol::FramingError::UnexpectedEof) => {
             debug!(client_id, "client disconnected before handshake");
@@ -640,25 +737,23 @@ pub(crate) fn handle_client_handshake(
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
 
-    set_client_recv_timeout(
-        &stream,
-        None,
-        "failed to clear client handshake read timeout",
-        client_id,
-    )?;
-
     // Create separate channels for reliable control messages and droppable renders.
     let writer_queue = ClientWriterQueue::new();
-    let writer = ClientWriter {
-        control: ClientControlWriter::queue(writer_queue.clone()),
-        render: ClientRenderWriter::queue(writer_queue.clone()),
-    };
+    let transport = ClientTransport::new(writer_queue.clone(), stream.try_clone()?);
+    let writer = ClientWriter::new(writer_queue.clone(), transport.clone());
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
     let writer_event_tx = server_event_tx.clone();
+    let writer_transport = transport.clone();
     std::thread::spawn(move || {
-        client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
+        client_writer_loop(
+            write_stream,
+            client_id,
+            writer_queue,
+            writer_transport,
+            writer_event_tx,
+        );
     });
 
     if should_quit.load(Ordering::Acquire) {
@@ -686,7 +781,7 @@ pub(crate) fn handle_client_handshake(
     }
 
     // Enter read loop — read client messages and forward to main loop.
-    client_read_loop(stream, client_id, server_event_tx, should_quit)
+    client_read_loop(stream, client_id, server_event_tx, should_quit, transport)
 }
 
 fn send_shutdown_to_unregistered_client(writer: &ClientWriter) {
@@ -708,6 +803,7 @@ fn client_writer_loop(
     mut stream: LocalStream,
     client_id: u64,
     writer_queue: Arc<ClientWriterQueue>,
+    transport: ClientTransport,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
     while let Some(item) = writer_queue.recv() {
@@ -720,7 +816,9 @@ fn client_writer_loop(
             }
         };
         if !written {
-            let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+            writer_queue.close_writer();
+            transport.retire();
+            transport.report_disconnect(client_id, &server_event_tx);
             break;
         }
     }
@@ -746,6 +844,7 @@ fn client_read_loop(
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
+    transport: ClientTransport,
 ) -> io::Result<()> {
     while !should_quit.load(Ordering::Acquire) {
         let msg: ClientMessage = match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE)
@@ -753,8 +852,7 @@ fn client_read_loop(
             Ok(msg) => msg,
             Err(protocol::FramingError::UnexpectedEof) => {
                 // Client disconnected.
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+                transport.retire_and_report_disconnect(client_id, server_event_tx);
                 break;
             }
             Err(protocol::FramingError::Oversized { claimed, max }) => {
@@ -762,14 +860,12 @@ fn client_read_loop(
                     client_id,
                     claimed, max, "oversized message from client, closing"
                 );
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+                transport.retire_and_report_disconnect(client_id, server_event_tx);
                 break;
             }
             Err(err) => {
                 debug!(client_id, err = %err, "client read error, closing");
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+                transport.retire_and_report_disconnect(client_id, server_event_tx);
                 break;
             }
         };
@@ -796,8 +892,7 @@ fn client_read_loop(
                             size = data.len(),
                             "oversized input from client, closing"
                         );
-                        let _ = server_event_tx
-                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        transport.retire_and_report_disconnect(client_id, server_event_tx);
                         break;
                     }
                 } else {
@@ -822,8 +917,7 @@ fn client_read_loop(
                         height_px,
                         "invalid pixel mouse geometry from client, closing"
                     );
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    transport.retire_and_report_disconnect(client_id, server_event_tx);
                     break;
                 };
                 if data.len() > MAX_PIXEL_MOUSE_PAYLOAD
@@ -835,8 +929,7 @@ fn client_read_loop(
                         max = MAX_PIXEL_MOUSE_PAYLOAD,
                         "invalid pixel mouse report from client, closing"
                     );
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    transport.retire_and_report_disconnect(client_id, server_event_tx);
                     break;
                 }
                 ServerEvent::ClientInputPixels {
@@ -855,8 +948,7 @@ fn client_read_loop(
                         count = events.len(),
                         "oversized input event batch from client, closing"
                     );
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    transport.retire_and_report_disconnect(client_id, server_event_tx);
                     break;
                 }
                 InputEventLimit::PasteTooLarge { size } => {
@@ -879,8 +971,7 @@ fn client_read_loop(
                         max = MAX_INPUT_PAYLOAD,
                         "oversized structured input payload from client, closing"
                     );
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    transport.retire_and_report_disconnect(client_id, server_event_tx);
                     break;
                 }
             },
@@ -919,8 +1010,7 @@ fn client_read_loop(
                         size = data.len(),
                         "oversized clipboard image from client, closing"
                     );
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    transport.retire_and_report_disconnect(client_id, server_event_tx);
                     break;
                 } else {
                     ServerEvent::ClientClipboardImage {
@@ -989,6 +1079,10 @@ fn client_read_loop(
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
+    #[cfg(windows)]
+    use std::io::Read as _;
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
 
     struct TestSocketPath(PathBuf);
@@ -1050,13 +1144,28 @@ mod tests {
 
     fn test_queue_writer() -> (ClientWriter, Arc<ClientWriterQueue>) {
         let queue = ClientWriterQueue::new();
-        (
-            ClientWriter {
-                control: ClientControlWriter::queue(queue.clone()),
-                render: ClientRenderWriter::queue(queue.clone()),
-            },
-            queue,
-        )
+        let writer = ClientWriter::new(queue.clone(), ClientTransport::test(queue.clone()));
+        (writer, queue)
+    }
+
+    #[cfg(unix)]
+    fn set_socket_buffer(stream: &LocalStream, option: libc::c_int, bytes: libc::c_int) {
+        let LocalStream::UdSocket(stream) = stream;
+        let result = unsafe {
+            libc::setsockopt(
+                stream.inner().as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "set socket buffer: {}",
+            io::Error::last_os_error()
+        );
     }
 
     fn frame_server_message(message: &ServerMessage) -> Vec<u8> {
@@ -1080,6 +1189,62 @@ mod tests {
             writer.render.try_send(second),
             Err(TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn client_writer_queue_bounds_control_items_and_bytes() {
+        let (writer, queue) = test_queue_writer();
+        for _ in 0..MAX_CONTROL_QUEUE_ITEMS {
+            writer.control.send(vec![b'x']).expect("control fits");
+        }
+        assert!(matches!(
+            writer.control.send(vec![b'y']),
+            Err(TrySendError::Full(_))
+        ));
+
+        let (byte_writer, byte_queue) = test_queue_writer();
+        byte_writer
+            .control
+            .send(vec![b'x'; MAX_CONTROL_QUEUE_BYTES])
+            .expect("control exactly at byte cap fits");
+        assert!(matches!(
+            byte_writer.control.send(vec![b'y']),
+            Err(TrySendError::Full(_))
+        ));
+
+        queue.close_writer();
+        byte_queue.close_writer();
+    }
+
+    #[test]
+    fn cleanup_replacement_obeys_control_capacity_and_close_discards_backlog() {
+        let (writer, queue) = test_queue_writer();
+        writer.render.try_send(vec![b'r']).expect("render fits");
+        writer
+            .render
+            .send_ordered(vec![b'o'])
+            .expect("ordered render fits");
+        for _ in 0..MAX_CONTROL_QUEUE_ITEMS {
+            writer.control.send(vec![b'c']).expect("control fits");
+        }
+
+        assert!(matches!(
+            writer.replace_with_cleanup(vec![b'g']),
+            Err(TrySendError::Full(_))
+        ));
+        {
+            let state = queue.lock_state();
+            assert!(state.render.is_none());
+            assert!(state.ordered.is_empty());
+            assert!(state.control.is_empty());
+            assert_eq!(state.control_bytes, 0);
+            assert!(!state.writer_alive);
+        }
+
+        queue.close_writer();
+        let state = queue.lock_state();
+        assert!(state.control.is_empty());
+        assert_eq!(state.control_bytes, 0);
     }
 
     #[test]
@@ -1123,7 +1288,8 @@ mod tests {
 
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let handle = std::thread::spawn(move || {
-            client_writer_loop(server_stream, 9, queue, server_event_tx);
+            let transport = ClientTransport::test(queue.clone());
+            client_writer_loop(server_stream, 9, queue, transport, server_event_tx);
         });
 
         match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read control") {
@@ -1153,7 +1319,8 @@ mod tests {
         let (server_event_tx, _server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 11, queue, server_event_tx);
+            let transport = ClientTransport::test(queue.clone());
+            client_writer_loop(server_stream, 11, queue, transport, server_event_tx);
             let _ = done_tx.send(());
         });
 
@@ -1161,6 +1328,80 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_millis(100))
             .expect("writer exits without polling after senders drop");
+    }
+
+    fn assert_retiring_transport_interrupts_blocked_writer(
+        _client_stream: LocalStream,
+        server_stream: LocalStream,
+    ) {
+        let queue = ClientWriterQueue::new();
+        let transport = ClientTransport::new(queue.clone(), server_stream.try_clone().unwrap());
+        let writer = ClientWriter::new(queue.clone(), transport.clone());
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            client_writer_loop(server_stream, 14, queue, transport, server_event_tx);
+            let _ = done_tx.send(());
+        });
+
+        writer
+            .control
+            .send(vec![b'x'; MAX_CONTROL_QUEUE_BYTES])
+            .expect("message is accepted before the peer stops draining");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "writer unexpectedly completed before transport retirement"
+        );
+
+        writer.retire();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retiring the transport interrupts the blocked writer");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "writer reports disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 14 }
+        ));
+        assert!(matches!(
+            writer.control.send(vec![b'y']),
+            Err(TrySendError::Disconnected(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retiring_transport_interrupts_a_writer_blocked_by_an_unread_peer() {
+        let (client_stream, server_stream, _path) = local_stream_pair("client-writer-retirement");
+        set_socket_buffer(&client_stream, libc::SO_RCVBUF, 1024);
+        set_socket_buffer(&server_stream, libc::SO_SNDBUF, 1024);
+
+        assert_retiring_transport_interrupts_blocked_writer(client_stream, server_stream);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retiring_transport_interrupts_a_writer_blocked_by_an_unread_peer() {
+        let (client_stream, server_stream, _path) = local_stream_pair("client-writer-retirement");
+
+        assert_retiring_transport_interrupts_blocked_writer(client_stream, server_stream);
+    }
+
+    #[test]
+    fn client_read_eof_retires_the_writer_queue() {
+        let (client_stream, server_stream, _path) = local_stream_pair("client-read-retirement");
+        let queue = ClientWriterQueue::new();
+        let transport = ClientTransport::test(queue.clone());
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+
+        drop(client_stream);
+        client_read_loop(server_stream, 15, &server_event_tx, &should_quit, transport)
+            .expect("client EOF is handled");
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "reader reports disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 15 }
+        ));
+        assert!(!queue.lock_state().writer_alive);
     }
 
     #[test]
@@ -1172,7 +1413,8 @@ mod tests {
         let (server_event_tx, _server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 12, queue, server_event_tx);
+            let transport = ClientTransport::test(queue.clone());
+            client_writer_loop(server_stream, 12, queue, transport, server_event_tx);
             let _ = done_tx.send(());
         });
 
@@ -1210,7 +1452,8 @@ mod tests {
         let (server_event_tx, _server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 13, queue, server_event_tx);
+            let transport = ClientTransport::test(queue.clone());
+            client_writer_loop(server_stream, 13, queue, transport, server_event_tx);
             let _ = done_tx.send(());
         });
 
@@ -1223,7 +1466,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("writer exits after socket write failure");
 
-        assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
+        assert!(matches!(
+            writer.control.send(vec![b'y']),
+            Err(TrySendError::Disconnected(_))
+        ));
         assert!(matches!(
             writer.render.try_send(vec![b'z']),
             Err(TrySendError::Disconnected(_))
@@ -1455,8 +1701,10 @@ new_tab = "ctrl+notakey"
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
+        let queue = ClientWriterQueue::new();
+        let transport = ClientTransport::test(queue.clone());
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit, transport)
         });
 
         protocol::write_message(
@@ -1498,6 +1746,7 @@ new_tab = "ctrl+notakey"
             }
             other => panic!("expected ClientPasteRejected, got {other:?}"),
         }
+        assert!(queue.lock_state().writer_alive);
 
         protocol::write_message(
             &mut client_stream,
@@ -1530,8 +1779,10 @@ new_tab = "ctrl+notakey"
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
+        let queue = ClientWriterQueue::new();
+        let transport = ClientTransport::test(queue.clone());
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit, transport)
         });
 
         protocol::write_message(
@@ -1546,6 +1797,7 @@ new_tab = "ctrl+notakey"
             recv_server_event(&mut server_event_rx, "oversized non-paste disconnect"),
             ServerEvent::ClientDisconnected { client_id: 7 }
         ));
+        assert!(!queue.lock_state().writer_alive);
 
         drop(client_stream);
         should_quit.store(true, Ordering::Release);
@@ -1563,7 +1815,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                ClientTransport::test(ClientWriterQueue::new()),
+            )
         });
 
         protocol::write_message(
@@ -1598,7 +1856,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                ClientTransport::test(ClientWriterQueue::new()),
+            )
         });
 
         protocol::write_message(
@@ -1633,7 +1897,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                ClientTransport::test(ClientWriterQueue::new()),
+            )
         });
         let mut data = bracketed_paste_with_total_len(MAX_INPUT_PAYLOAD + 1);
         data[b"\x1b[200~".len()] = 0xff;
@@ -1661,7 +1931,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                ClientTransport::test(ClientWriterQueue::new()),
+            )
         });
         let events = vec![
             ClientInputEvent::Key {
@@ -1714,7 +1990,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                ClientTransport::test(ClientWriterQueue::new()),
+            )
         });
 
         protocol::write_message(
@@ -1749,7 +2031,13 @@ new_tab = "ctrl+notakey"
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                ClientTransport::test(ClientWriterQueue::new()),
+            )
         });
 
         let maximum = vec![
@@ -1881,5 +2169,115 @@ new_tab = "ctrl+notakey"
              connection close within the 5-second deadline",
             HANDSHAKE_TIMEOUT
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_handshake_rejects_hello_that_trickles_past_total_deadline() {
+        use std::io::Write as _;
+
+        let (mut client_stream, mut server_stream, _path) = local_stream_pair("trickled-hello");
+        let mut frame = Vec::new();
+        protocol::write_message(
+            &mut frame,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 100,
+                rows: 30,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::SemanticFrame,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::App,
+            },
+        )
+        .expect("encode hello");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            client_stream
+                .write_all(&frame[..1])
+                .expect("write first hello byte");
+            client_stream.flush().expect("flush first hello byte");
+            started_tx.send(()).expect("signal first hello byte");
+            for byte in &frame[1..] {
+                std::thread::sleep(Duration::from_millis(15));
+                if client_stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                if client_stream.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        let timeout = Duration::from_millis(50);
+        let deadline = timeout + Duration::from_millis(250);
+
+        started_rx.recv().expect("first hello byte arrives");
+        let started = std::time::Instant::now();
+        let result = read_client_hello(&mut server_stream, timeout);
+
+        assert!(matches!(
+            result,
+            Err(protocol::FramingError::Io(ref err)) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            started.elapsed() <= deadline,
+            "trickled Hello exceeded the {deadline:?} total deadline"
+        );
+        writer.join().expect("trickle writer join");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_idle_named_pipe_handshake_observes_deadline() {
+        let (client_stream, server_stream, _path) = local_stream_pair("idle-handshake");
+        let (server_event_tx, _server_event_rx) = mpsc::channel(1);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            let _ = done_tx.send(handle_client_handshake(
+                server_stream,
+                42,
+                &server_event_tx,
+                &handshake_quit,
+            ));
+        });
+        let deadline = HANDSHAKE_TIMEOUT + Duration::from_millis(250);
+        let completed = done_rx.recv_timeout(deadline);
+
+        drop(client_stream);
+        handle.join().expect("handshake thread join");
+
+        let result = completed.unwrap_or_else(|err| {
+            panic!("idle named-pipe handshake did not finish within {deadline:?}: {err}")
+        });
+        result.expect("idle named-pipe handshake result");
+        assert!(
+            started.elapsed() <= deadline,
+            "idle named-pipe handshake exceeded {deadline:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handshake_reader_rejects_buffered_input_after_deadline() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("expired-handshake");
+        let mut stream = server_stream;
+        let mut reader = crate::ipc::DeadlineLocalStreamReader::new(
+            &mut stream,
+            std::time::Instant::now() + Duration::from_millis(20),
+            "client handshake timed out",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        client_stream.write_all(b"x").unwrap();
+        client_stream.flush().unwrap();
+        let mut byte = [0_u8; 1];
+
+        let error = reader.read(&mut byte).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

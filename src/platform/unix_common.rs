@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
+};
+
+static CLI_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
 
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -11,12 +16,22 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     }
 }
 
-pub(crate) fn begin_cli_output() {
-    set_sigpipe_disposition(libc::SIG_DFL);
+pub(crate) struct CliOutputGuard {
+    _lock: MutexGuard<'static, ()>,
 }
 
-pub(crate) fn end_cli_output() {
-    set_sigpipe_disposition(libc::SIG_IGN);
+impl Drop for CliOutputGuard {
+    fn drop(&mut self) {
+        set_sigpipe_disposition(libc::SIG_IGN);
+    }
+}
+
+pub(crate) fn cli_output_guard() -> CliOutputGuard {
+    let lock = CLI_OUTPUT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_sigpipe_disposition(libc::SIG_DFL);
+    CliOutputGuard { _lock: lock }
 }
 
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
@@ -237,6 +252,21 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sigpipe_handler() -> libc::sighandler_t {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut action) };
+        assert_eq!(result, 0);
+        action.sa_sigaction
+    }
+
+    #[test]
+    fn cli_output_guard_restores_ignored_sigpipe() {
+        let guard = cli_output_guard();
+        assert_eq!(sigpipe_handler(), libc::SIG_DFL);
+        drop(guard);
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN);
+    }
 
     #[test]
     fn plugin_pane_pwd_defaults_to_cwd_without_overriding_explicit_env() {

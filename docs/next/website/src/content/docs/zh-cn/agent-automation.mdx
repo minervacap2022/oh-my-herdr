@@ -56,6 +56,25 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+### 持久化 profile spawn
+
+当一个角色需要跨会话保留 profile 和副本编号时，使用 `agent spawn`。它会创建或复用该角色的已保存 profile，把第一个实例命名为角色名，并把后续仍存活的实例命名为 `reviewer-replica-1` 这类名称。在选定的标签页（默认是活动标签页）中，Herdr 会复用第一个可用 shell；没有可用 shell 时，会自动分割最后一个窗格来腾出位置。
+
+`--kind` 只为本次启动覆盖已保存 profile 的 harness；省略时使用已保存的 harness（默认 `codex`）。使用 `--tab <tab_id>` 可在不改变焦点的情况下指定后台标签页。默认的 `--cwd tab` 从目标标签页的工作目录启动。`--cwd agent` 使用 profile 自己的 native 目录；首次 spawn 时该目录由标签页初始化。存在可用 shell 时会立即使用。需要自动分割时，请求会等待新 shell 回到提示符后再提交智能体命令，最多轮询两秒；如果 shell 未准备好，Herdr 会回滚新窗格并返回 `agent_spawn_failed`。命令提交后，检测稳定前响应可能返回 `launch_pending`。`--timeout` 是 3001–300000 毫秒的受管检测期限，不承诺响应会等待 ready。编排必须等待 ready 时，随后使用 `agent wait <name> --until idle`。
+
+```bash
+herdr agent spawn reviewer --kind claude --tab w1:t2 --cwd tab -- --model sonnet
+herdr agent wait reviewer --until idle
+```
+
+使用 `agent create <role> --harness codex|pi|claude --cwd <dir> [--instructions-file <path>]` 创建原生 profile。它会创建当前会话专属的 `agent-context/<role>/AGENTS.md`，并返回准确路径；编辑此文件即可更新 agent 的持久指令。Codex 使用原生 `model_instructions_file`，Pi 使用 `--append-system-prompt`，Claude 使用 `--append-system-prompt-file`。`agent profile` 查看一个 profile，`agent profiles` 列出所有 profile；socket 也提供 `agent.profile.create`、`agent.profile.get`、`agent.profile.list`、`agent.profile.set` 和 `agent.profile.set_md`。
+
+### 在 Herdr 中创建并运行原生 profile
+
+Agents 侧边栏区域左下角现在提供与 Spaces 相同样式的 **new** 控件。点击后打开同一个原生 profile 表单，默认选择 Codex；可在 harness 字段改为 Pi 或 Claude。每个已保存 profile 会显示名称和 native working directory，其下显示对应的实时 agent pane。在活动 Space 中点击已保存 profile，可以选择 **Use space cwd** 或 **Use agent native cwd**；无论选择哪种方式，profile 自己的 `AGENTS.md` 都会保留。创建 Space 时会提示输入 native working directory，留空则使用 `~`。也可以在 Herdr 内打开 **Settings → Agents**（默认快捷键：先按 `ctrl+b`，再按 `s`）。填写角色、native working directory 和初始 `AGENTS.md` 指令并保存。按 `e` 可修改已保存 profile 的 native harness 或 working directory。
+
+使用 `agent.profile.get` 和 `agent.profile.list` 读取已保存的配置。`agent.profile.set` 会原子更新 profile 的 harness、native cwd、model、effort、API-key reference 或 allowlist；使用 `clear_model`、`clear_effort`、`clear_apikey_ref` 或 `clear_allowlist` 清除可选值。通用 spawn 会为 Claude、Codex 和 Pi 应用 model 与 effort；为 Claude 和 Pi 应用 `{"tools":[...]}` allowlist。API-key reference 使用 `env:NAME` 环境变量引用，可用于 Claude 和 Codex；不受支持的设置会明确失败，而不是静默忽略。显式设置的 `native_cwd` 必须是存在的 UTF-8 目录。profile Markdown 仍通过 `agent.profile.set_md` 管理。
+
 ## 选择控制界面
 
 | 目标 | 命令 |
@@ -65,6 +84,7 @@ herdr agent rename w1:p2 reviewer
 | 发送终端按键或修饰键组合 | `pane send-keys` |
 | 等待文本或正则表达式 | `pane wait-output` |
 | 在现有窗格中启动受支持的智能体 | `agent start` |
+| 启动持久化角色 profile | `agent spawn` |
 | 提交提示,并可选择等待 | `agent prompt` |
 | 向智能体交互界面发送按键 | `agent send-keys` |
 | 等待智能体生命周期状态 | `agent wait` |

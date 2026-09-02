@@ -256,6 +256,41 @@ impl App {
             return;
         }
 
+        if params.force {
+            match self.leased_plugin_root_within(&space.checkout_path) {
+                Ok(Some(plugin_root)) => {
+                    Self::send_api_response(
+                        respond_to,
+                        encode_error(
+                            id,
+                            "plugin_command_in_progress",
+                            format!(
+                                "cannot force-remove {} while a plugin command is running from {}",
+                                space.checkout_path.display(),
+                                plugin_root.display()
+                            ),
+                        ),
+                    );
+                    return;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    Self::send_api_response(
+                        respond_to,
+                        encode_error(
+                            id,
+                            "plugin_command_lease_check_failed",
+                            format!(
+                                "cannot force-remove {} because plugin command lease state is unavailable: {err}",
+                                space.checkout_path.display()
+                            ),
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+
         #[cfg(windows)]
         {
             if !params.force

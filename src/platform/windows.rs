@@ -25,12 +25,15 @@ use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
         Foundation::{
-            CloseHandle, GlobalFree, LocalFree, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE,
-            NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
+            CloseHandle, GlobalFree, LocalFree, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE, HWND,
+            INVALID_HANDLE_VALUE, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
         Security::SECURITY_ATTRIBUTES,
-        Storage::FileSystem::CreateDirectoryW,
+        Storage::FileSystem::{
+            CreateDirectoryW, MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING,
+            MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
+        },
         System::{
             Console::GetConsoleWindow,
             DataExchange::{
@@ -189,6 +192,58 @@ fn extended_length_path(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
     };
     extended.push(0);
     Ok(extended)
+}
+
+pub(crate) fn replace_file(
+    replacement: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    let replacement = extended_length_path(replacement)?;
+    let target = extended_length_path(target)?;
+    replace_file_with(
+        || {
+            let replaced = unsafe {
+                ReplaceFileW(
+                    target.as_ptr(),
+                    replacement.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if replaced != 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+        || {
+            let moved = unsafe {
+                MoveFileExW(
+                    replacement.as_ptr(),
+                    target.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if moved != 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+    )
+}
+
+fn replace_file_with(
+    replace_existing: impl FnOnce() -> std::io::Result<()>,
+    move_replacement: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match replace_existing() {
+        Ok(()) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => move_replacement(),
+        Err(err) => Err(err),
+    }
 }
 
 pub(crate) fn remote_private_temp_base() -> PathBuf {
@@ -506,7 +561,7 @@ fn raw_command_shell(comspec: Option<std::ffi::OsString>) -> std::ffi::OsString 
 pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
     let shell_name = shell_name.to_ascii_lowercase();
     let powershell = shell_name.contains("powershell") || shell_name.contains("pwsh");
-    let script = powershell_agent_script(argv)?;
+    let script = powershell_agent_script(argv, None)?;
     if powershell {
         Some(script)
     } else {
@@ -514,7 +569,48 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     }
 }
 
-fn powershell_agent_script(argv: &[String]) -> Option<String> {
+pub(crate) fn interactive_shell_command_in_cwd(
+    argv: &[String],
+    shell_name: &str,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let cwd = cwd.to_str()?;
+    let script = powershell_agent_script(argv, Some(cwd))?;
+    let script = if argv.len() == 1 {
+        format!(
+            "Set-Location -LiteralPath {}; {script}",
+            super::quote_powershell_arg(cwd)
+        )
+    } else {
+        script
+    };
+    let shell_name = shell_name.to_ascii_lowercase();
+    if shell_name.contains("powershell") || shell_name.contains("pwsh") {
+        Some(script)
+    } else {
+        Some(cmd_encoded_powershell_command(&script))
+    }
+}
+
+pub(crate) fn interactive_shell_command_with_env_in_cwd(
+    argv: &[String],
+    shell_name: &str,
+    cwd: &std::path::Path,
+    target_env: &str,
+    source_env: &str,
+) -> Option<String> {
+    let cwd = cwd.to_str()?;
+    let script = powershell_agent_script(argv, Some(cwd))?;
+    let script = format!("& {{ $env:{target_env} = $env:{source_env}; {script} }}");
+    let shell_name = shell_name.to_ascii_lowercase();
+    if shell_name.contains("powershell") || shell_name.contains("pwsh") {
+        Some(script)
+    } else {
+        Some(cmd_encoded_powershell_command(&script))
+    }
+}
+
+fn powershell_agent_script(argv: &[String], cwd: Option<&str>) -> Option<String> {
     let (program, args) = argv.split_first()?;
     if args.is_empty() {
         return Some(format!("& {}", super::quote_powershell_arg(program)));
@@ -525,11 +621,17 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
         .map(|arg| quote_windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    Some(format!(
-        "$p=Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait -PassThru",
+    let mut script = format!(
+        "$p=Start-Process -FilePath {} -ArgumentList {}",
         super::quote_powershell_arg(program),
         super::quote_powershell_arg(&command_line),
-    ))
+    );
+    if let Some(cwd) = cwd {
+        script.push_str(" -WorkingDirectory ");
+        script.push_str(&super::quote_powershell_arg(cwd));
+    }
+    script.push_str(" -NoNewWindow -Wait -PassThru");
+    Some(script)
 }
 
 fn quote_windows_command_line_arg(value: &str) -> String {
@@ -2528,6 +2630,89 @@ mod tests {
     };
 
     #[test]
+    fn windows_replace_file_falls_back_only_when_the_target_is_missing() {
+        let mut replace_calls = 0;
+        let mut move_calls = 0;
+        super::replace_file_with(
+            || {
+                replace_calls += 1;
+                Err(std::io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32,
+                ))
+            },
+            || {
+                move_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("missing target should use the move fallback");
+
+        assert_eq!(replace_calls, 1);
+        assert_eq!(move_calls, 1);
+    }
+
+    #[test]
+    fn windows_replace_file_preserves_non_missing_replace_errors() {
+        let mut move_calls = 0;
+        let err = super::replace_file_with(
+            || Err(std::io::Error::from_raw_os_error(5)),
+            || {
+                move_calls += 1;
+                Ok(())
+            },
+        )
+        .expect_err("access denied must not fall back to a move");
+
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert_eq!(move_calls, 0);
+    }
+
+    #[test]
+    fn windows_replace_file_replaces_existing_target() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-replace-existing-{}-{}",
+            std::process::id(),
+            super::next_pane_runtime_marker()
+        ));
+        fs::create_dir_all(&base).expect("create replacement fixture");
+        let replacement = base.join("replacement.json");
+        let target = base.join("target.json");
+        fs::write(&replacement, b"replacement").expect("write replacement");
+        fs::write(&target, b"target").expect("write target");
+
+        super::replace_file(&replacement, &target).expect("replace existing target");
+
+        assert_eq!(
+            fs::read(&target).expect("read replacement target"),
+            b"replacement"
+        );
+        assert!(!replacement.exists());
+        fs::remove_dir_all(base).expect("remove replacement fixture");
+    }
+
+    #[test]
+    fn windows_replace_file_creates_missing_target() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-replace-missing-{}-{}",
+            std::process::id(),
+            super::next_pane_runtime_marker()
+        ));
+        fs::create_dir_all(&base).expect("create replacement fixture");
+        let replacement = base.join("replacement.json");
+        let target = base.join("target.json");
+        fs::write(&replacement, b"replacement").expect("write replacement");
+
+        super::replace_file(&replacement, &target).expect("create missing target");
+
+        assert_eq!(
+            fs::read(&target).expect("read created target"),
+            b"replacement"
+        );
+        assert!(!replacement.exists());
+        fs::remove_dir_all(base).expect("remove replacement fixture");
+    }
+
+    #[test]
     fn private_remote_directory_supports_long_paths() {
         let base = std::env::temp_dir().join(format!(
             "herdr-private-remote-dir-test-{}",
@@ -2649,6 +2834,21 @@ mod tests {
     }
 
     #[test]
+    fn powershell_agent_command_in_cwd_uses_shell_location_without_arguments() {
+        let argv = vec!["opencode".into()];
+
+        assert_eq!(
+            super::interactive_shell_command_in_cwd(
+                &argv,
+                "powershell.exe",
+                std::path::Path::new(r"C:\repo"),
+            )
+            .as_deref(),
+            Some("Set-Location -LiteralPath 'C:\\repo'; & opencode")
+        );
+    }
+
+    #[test]
     fn cmd_agent_command_encodes_edge_arguments_without_cmd_expansion() {
         use base64::Engine as _;
 
@@ -2673,6 +2873,35 @@ mod tests {
         assert_eq!(
             String::from_utf16(&utf16).unwrap(),
             "$p=Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b' -NoNewWindow -Wait -PassThru"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_command_in_cwd_encodes_cmd_metacharacters() {
+        use base64::Engine as _;
+
+        let cwd = std::path::Path::new(r"C:\repo\%EXPAND%&!^()<>|");
+        let command = super::interactive_shell_command_in_cwd(
+            &["pi".into(), "--model".into(), "test".into()],
+            "cmd.exe",
+            cwd,
+        )
+        .unwrap();
+        assert!(command.starts_with("powershell.exe -NoLogo -NoProfile -EncodedCommand "));
+        assert!(!command.contains("%EXPAND%"));
+        assert!(!command.contains('&'));
+
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf16(&utf16).unwrap(),
+            "$p=Start-Process -FilePath pi -ArgumentList '--model test' -WorkingDirectory 'C:\\repo\\%EXPAND%&!^()<>|' -NoNewWindow -Wait -PassThru"
         );
     }
 

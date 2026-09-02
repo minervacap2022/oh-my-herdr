@@ -148,6 +148,152 @@ fn agent_start_and_prompt_requests_round_trip() {
         serde_json::from_value::<Request>(prompt_and_wait_json).unwrap(),
         prompt_and_wait
     );
+
+    let spawn = Request {
+        id: "spawn".into(),
+        method: Method::AgentSpawn(AgentSpawnParams {
+            role: "reviewer".into(),
+            kind: Some("pi".into()),
+            tab_id: Some("w1:t2".into()),
+            cwd_mode: "agent".into(),
+            timeout_ms: Some(30_000),
+            args: vec!["--no-session".into()],
+        }),
+    };
+    let spawn_json = serde_json::to_value(&spawn).unwrap();
+    assert_eq!(spawn_json["method"], "agent.spawn");
+    assert_eq!(
+        serde_json::from_value::<Request>(spawn_json).unwrap(),
+        spawn
+    );
+
+    let revive = Request {
+        id: "revive".into(),
+        method: Method::AgentRevive(AgentReviveParams {
+            instance_id: "reviewer:3".into(),
+            tab_id: Some("w1:t2".into()),
+            cwd_mode: "agent".into(),
+            timeout_ms: Some(30_000),
+            args: vec!["--no-session".into()],
+        }),
+    };
+    let revive_json = serde_json::to_value(&revive).unwrap();
+    assert_eq!(revive_json["method"], "agent.revive");
+    assert_eq!(
+        serde_json::from_value::<Request>(revive_json).unwrap(),
+        revive
+    );
+
+    let roster = Request {
+        id: "roster".into(),
+        method: Method::AgentRosterList(EmptyParams::default()),
+    };
+    assert_eq!(
+        serde_json::from_value::<Request>(serde_json::to_value(&roster).unwrap()).unwrap(),
+        roster
+    );
+
+    let profile_md = Request {
+        id: "profile-md".into(),
+        method: Method::AgentProfileSetMd(AgentProfileSetMdParams {
+            role: "reviewer".into(),
+            name: "context.md".into(),
+            path: Some("/tmp/context.md".into()),
+        }),
+    };
+    let profile_md_json = serde_json::to_value(&profile_md).unwrap();
+    assert_eq!(profile_md_json["method"], "agent.profile.set_md");
+    assert_eq!(
+        serde_json::from_value::<Request>(profile_md_json).unwrap(),
+        profile_md
+    );
+
+    let profile_create = Request {
+        id: "profile-create".into(),
+        method: Method::AgentProfileCreate(AgentProfileCreateParams {
+            role: "builder".into(),
+            harness: "codex".into(),
+            native_cwd: "/tmp".into(),
+            instructions: Some("follow the build checklist".into()),
+        }),
+    };
+    let profile_create_json = serde_json::to_value(&profile_create).unwrap();
+    assert_eq!(profile_create_json["method"], "agent.profile.create");
+    assert_eq!(
+        serde_json::from_value::<Request>(profile_create_json).unwrap(),
+        profile_create
+    );
+
+    let profile_set = Request {
+        id: "profile-set".into(),
+        method: Method::AgentProfileSet(AgentProfileSetParams {
+            role: "reviewer".into(),
+            harness: Some("claude".into()),
+            native_cwd: Some("/tmp".into()),
+            model: Some("sonnet".into()),
+            effort: Some(AgentProfileEffort::High),
+            apikey_ref: Some("env:REVIEWER_API_KEY".into()),
+            allowlist: Some(serde_json::json!({"tools":["read"]})),
+            clear_model: false,
+            clear_effort: false,
+            clear_apikey_ref: false,
+            clear_allowlist: false,
+        }),
+    };
+    let profile_set_json = serde_json::to_value(&profile_set).unwrap();
+    assert_eq!(profile_set_json["method"], "agent.profile.set");
+    assert_eq!(
+        serde_json::from_value::<Request>(profile_set_json).unwrap(),
+        profile_set
+    );
+
+    let profile_get = Request {
+        id: "profile-get".into(),
+        method: Method::AgentProfileGet(AgentProfileGetParams {
+            role: "reviewer".into(),
+        }),
+    };
+    assert_eq!(
+        serde_json::from_value::<Request>(serde_json::to_value(&profile_get).unwrap()).unwrap(),
+        profile_get
+    );
+}
+
+#[test]
+fn agent_spawn_schema_publishes_runtime_constraints() {
+    let params = protocol_schema_entry::<AgentSpawnParams>("agent_spawn");
+    assert_eq!(
+        params["properties"]["cwd_mode"]["enum"],
+        serde_json::json!(["tab", "agent"])
+    );
+    assert_eq!(
+        params["properties"]["timeout_ms"]["minimum"],
+        serde_json::json!(3001)
+    );
+    assert_eq!(
+        params["properties"]["timeout_ms"]["maximum"],
+        serde_json::json!(300000)
+    );
+    assert_eq!(
+        params["properties"]["role"]["pattern"],
+        "^[a-z][a-z0-9_-]{0,31}$"
+    );
+    assert_eq!(
+        params["properties"]["tab_id"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+
+    for params in [
+        protocol_schema_entry::<AgentProfileGetParams>("agent_profile_get"),
+        protocol_schema_entry::<AgentProfileSetParams>("agent_profile_set"),
+        protocol_schema_entry::<AgentProfileSetMdParams>("agent_profile_set_md"),
+        protocol_schema_entry::<AgentProfileCreateParams>("agent_profile_create"),
+    ] {
+        assert_eq!(
+            params["properties"]["role"]["pattern"],
+            "^[a-z][a-z0-9_-]{0,31}$"
+        );
+    }
 }
 
 #[test]

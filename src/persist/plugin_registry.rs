@@ -32,20 +32,21 @@ fn with_registry_lock<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std:
 }
 
 fn save_json_to_path<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> std::io::Result<()> {
+    save_json_to_path_with_replace(path, value, crate::platform::replace_file)
+}
+
+fn save_json_to_path_with_replace<T: serde::Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    replace_file: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(value)?;
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, json)?;
-    #[cfg(windows)]
-    if path.exists() {
-        if let Err(err) = std::fs::remove_file(path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-    }
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
+    if let Err(err) = replace_file(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
@@ -278,5 +279,22 @@ mod tests {
         let loaded = load_from_path(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].plugin_id, "example.second");
+    }
+
+    #[test]
+    fn failed_registry_replacement_preserves_existing_file() {
+        let path = temp_registry_path("replace-failure");
+        save_to_path(&path, &[sample_plugin("example.first")]).unwrap();
+        let existing = std::fs::read_to_string(&path).unwrap();
+
+        let err =
+            save_json_to_path_with_replace(&path, &[sample_plugin("example.second")], |_, _| {
+                Err(std::io::Error::other("forced replacement failure"))
+            })
+            .expect_err("replacement failure should propagate");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        assert!(!path.with_extension("json.tmp").exists());
     }
 }

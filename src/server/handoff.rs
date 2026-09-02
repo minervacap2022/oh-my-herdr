@@ -1,4 +1,8 @@
 #[cfg(unix)]
+use std::ffi::CStr;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
@@ -9,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, Command};
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
@@ -54,8 +58,63 @@ pub(crate) struct ReceivedHandoff {
 }
 
 #[cfg(unix)]
-pub(crate) fn handoff_socket_path() -> PathBuf {
-    crate::session::data_dir().join(format!("herdr-handoff-{}.sock", std::process::id()))
+pub(crate) struct HandoffSocket {
+    path: PathBuf,
+    directory: PathBuf,
+}
+
+#[cfg(unix)]
+impl HandoffSocket {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn bind_listener(&mut self) -> io::Result<UnixListener> {
+        let listener = UnixListener::bind(&self.path)?;
+        let setup = (|| -> io::Result<()> {
+            listener.set_nonblocking(true)?;
+            restrict_socket_permissions(&self.path)?;
+            Ok(())
+        })();
+        match setup {
+            Ok(()) => Ok(listener),
+            Err(error) => {
+                drop(listener);
+                Err(error)
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HandoffSocket {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn handoff_socket() -> io::Result<HandoffSocket> {
+    let mut template = b"/tmp/herdr-handoff-XXXXXX\0".to_vec();
+    let directory = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    if directory.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let directory = PathBuf::from(
+        unsafe { CStr::from_ptr(directory) }
+            .to_string_lossy()
+            .into_owned(),
+    );
+    Ok(HandoffSocket {
+        path: directory.join("h.sock"),
+        directory,
+    })
 }
 
 #[cfg(unix)]
@@ -132,26 +191,15 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
 }
 
 #[cfg(unix)]
-pub(crate) fn bind_listener(socket_path: &Path) -> io::Result<UnixListener> {
-    let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
-    listener.set_nonblocking(true)?;
-    restrict_socket_permissions(socket_path)?;
-    Ok(listener)
-}
-
-#[cfg(unix)]
 pub(crate) fn accept_and_validate_on(
     listener: UnixListener,
-    socket_path: &Path,
     token: &str,
     manifest: &HandoffManifest,
 ) -> io::Result<UnixStream> {
     let (mut stream, _) = accept_with_timeout(&listener, READY_TIMEOUT)?;
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
     stream.set_write_timeout(Some(READY_TIMEOUT))?;
-    let token_line = read_line_unbuffered(&mut stream)?;
+    let token_line = read_line_unbuffered(&mut stream, Instant::now() + READY_TIMEOUT)?;
     if token_line.trim_end() != token {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -163,12 +211,10 @@ pub(crate) fn accept_and_validate_on(
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let validated = read_line_unbuffered(&mut stream)?;
+    let validated = read_line_unbuffered(&mut stream, Instant::now() + READY_TIMEOUT)?;
     if validated.trim_end() != "validated" {
         return Err(io::Error::other("handoff import did not validate manifest"));
     }
-    let _ = std::fs::remove_file(socket_path);
     Ok(stream)
 }
 
@@ -182,8 +228,7 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
     }
     send_fds(stream, fds)?;
 
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let restored = read_line_unbuffered(&mut *stream)?;
+    let restored = read_line_unbuffered(&mut *stream, Instant::now() + READY_TIMEOUT)?;
     if restored.trim_end() != "restored" {
         return Err(io::Error::other(
             "handoff import did not report restored runtimes",
@@ -194,8 +239,7 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
 
 #[cfg(unix)]
 pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let ready = read_line_unbuffered(&mut *stream)?;
+    let ready = read_line_unbuffered(&mut *stream, Instant::now() + READY_TIMEOUT)?;
     if ready.trim_end() != "ready" {
         return Err(io::Error::other("handoff import did not report ready"));
     }
@@ -210,11 +254,7 @@ pub(crate) fn report_committed(stream: &mut UnixStream) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
-    if let Err(err) = stream.set_read_timeout(Some(OWNED_ACK_TIMEOUT)) {
-        warn!(err = %err, "failed to set handoff ownership ack timeout");
-        return;
-    }
-    match read_line_unbuffered(&mut *stream) {
+    match read_line_unbuffered(&mut *stream, Instant::now() + OWNED_ACK_TIMEOUT) {
         Ok(owned) if owned.trim_end() == "owned" => {}
         Ok(other) => {
             warn!(
@@ -235,7 +275,7 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    let manifest_line = read_line_unbuffered(&mut stream)?;
+    let manifest_line = read_line_unbuffered(&mut stream, Instant::now() + READY_TIMEOUT)?;
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
     if manifest.version != HANDOFF_VERSION {
@@ -289,8 +329,7 @@ pub(crate) fn report_ready(stream: &mut UnixStream) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let committed = read_line_unbuffered(&mut *stream)?;
+    let committed = read_line_unbuffered(&mut *stream, Instant::now() + READY_TIMEOUT)?;
     if committed.trim_end() != "committed" {
         return Err(io::Error::other("handoff source did not commit"));
     }
@@ -355,16 +394,39 @@ fn accept_with_timeout(
 }
 
 #[cfg(unix)]
-fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
+fn read_line_unbuffered(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        let read = stream.read(&mut byte)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "handoff stream closed while reading line",
-            ));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(handoff_line_timeout_error());
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "handoff stream closed while reading line",
+                ));
+            }
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(handoff_line_timeout_error());
+                }
+                continue;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+        if Instant::now() >= deadline {
+            return Err(handoff_line_timeout_error());
         }
         bytes.push(byte[0]);
         if byte[0] == b'\n' {
@@ -378,6 +440,11 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
             ));
         }
     }
+}
+
+#[cfg(unix)]
+fn handoff_line_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "handoff line read timed out")
 }
 
 #[cfg(unix)]
@@ -464,6 +531,14 @@ fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
             "expected {expected} handoff fds, received fewer"
         )));
     }
+    for &fd in &out {
+        if let Err(err) = crate::pty::fd::set_cloexec(fd) {
+            for fd in out {
+                let _ = unsafe { libc::close(fd) };
+            }
+            return Err(err);
+        }
+    }
     Ok(out)
 }
 
@@ -475,6 +550,9 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {
@@ -502,6 +580,49 @@ mod tests {
     }
 
     #[test]
+    fn handoff_socket_uses_a_short_fresh_private_temp_directory() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut socket = handoff_socket().expect("handoff socket should allocate");
+        let path = socket.path().to_owned();
+        let directory = path
+            .parent()
+            .expect("handoff socket should have a parent directory")
+            .to_owned();
+        let metadata = fs::metadata(&directory).expect("handoff directory should exist");
+
+        assert_eq!(directory.parent(), Some(Path::new("/tmp")));
+        assert_eq!(metadata.mode() & 0o077, 0);
+        assert!(path.to_string_lossy().len() < 64);
+
+        let listener = socket
+            .bind_listener()
+            .expect("handoff socket should bind inside its private directory");
+        drop(listener);
+        drop(socket);
+
+        assert!(!path.exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn handoff_socket_cleans_up_after_bind_failure() {
+        let mut socket = handoff_socket().expect("handoff socket should allocate");
+        let path = socket.path().to_owned();
+        let directory = path
+            .parent()
+            .expect("handoff socket should have a parent directory")
+            .to_owned();
+        fs::write(&path, b"occupied").expect("socket path should be occupied for the test");
+
+        assert!(socket.bind_listener().is_err());
+        drop(socket);
+
+        assert!(!path.exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
     fn a_manifest_written_before_the_title_field_still_loads() {
         let manifest = manifest_for(
             empty_snapshot(),
@@ -520,5 +641,59 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    #[test]
+    fn received_handoff_fds_close_on_exec() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let source = File::open("/dev/null").unwrap();
+
+        send_fds(&sender, &[source.as_raw_fd()]).unwrap();
+        let received = recv_fds(&receiver, 1).unwrap();
+        let flags = unsafe { libc::fcntl(received[0], libc::F_GETFD) };
+
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        unsafe { libc::close(received[0]) };
+    }
+
+    #[test]
+    fn handoff_line_read_rejects_trickle_past_total_deadline() {
+        use std::io::Write as _;
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            writer.write_all(b"r").expect("write first line byte");
+            writer.flush().expect("flush first line byte");
+            started_tx.send(()).expect("signal first line byte");
+            for byte in b"eady\n" {
+                std::thread::sleep(Duration::from_millis(15));
+                if writer.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                if writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        let timeout = Duration::from_millis(50);
+        let deadline = timeout + Duration::from_millis(250);
+
+        started_rx.recv().expect("first line byte arrives");
+        let started = std::time::Instant::now();
+        let result = read_line_unbuffered(&mut reader, std::time::Instant::now() + timeout);
+
+        assert!(
+            matches!(
+                result,
+                Err(ref error) if error.kind() == io::ErrorKind::TimedOut
+            ),
+            "unexpected handoff line result: {result:?}"
+        );
+        assert!(
+            started.elapsed() <= deadline,
+            "trickled handoff line exceeded the {deadline:?} total deadline"
+        );
+        writer.join().expect("trickle writer join");
     }
 }

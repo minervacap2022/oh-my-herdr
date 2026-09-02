@@ -16,6 +16,7 @@ fi
 sessions=("default" "work" "api")
 ports=()
 server_pids=()
+http_pids=()
 
 cleanup() {
   set +e
@@ -87,7 +88,7 @@ wait_for_http() {
   local port="$1"
   local expected="$2"
   for _ in {1..200}; do
-    if curl -fsS "http://127.0.0.1:$port/" | grep -q "$expected"; then
+    if curl -fsS "http://127.0.0.1:$port/" 2>/dev/null | grep -q "$expected"; then
       return 0
     fi
     sleep 0.05
@@ -151,7 +152,13 @@ while not response.endswith(b"\n"):
     if not chunk:
         break
     response += chunk
-if b'"error"' in response:
+if not response.endswith(b"\n"):
+    raise SystemExit("pane.send_input returned an incomplete API response")
+try:
+    payload = json.loads(response)
+except json.JSONDecodeError as error:
+    raise SystemExit(f"pane.send_input returned invalid JSON: {error}")
+if payload.get("error") or payload.get("result", {}).get("type") != "ok":
     raise SystemExit(response.decode())
 PY
 }
@@ -166,16 +173,24 @@ sock.close()
 PY
 }
 
-smoke_http_count() {
-  local count=0
-  local port matches
-  for port in "${ports[@]}"; do
-    matches="$(pgrep -fc "python3 -m http.server $port --bind 127.0.0.1" || true)"
-    if [[ -n "$matches" ]]; then
-      count=$((count + matches))
+smoke_http_pid() {
+  local port="$1"
+  local matches pid
+  local -a matched_pids=()
+
+  matches="$(pgrep -f "[Pp]ython(3(\.[0-9]+)?)? -m http\.server $port --bind 127\.0\.0\.1" 2>/dev/null || true)"
+  while IFS= read -r pid; do
+    if [[ -n "$pid" ]]; then
+      matched_pids+=("$pid")
     fi
-  done
-  printf '%s\n' "$count"
+  done <<< "$matches"
+
+  if (( ${#matched_pids[@]} != 1 )); then
+    echo "expected one smoke HTTP server on port $port, found ${#matched_pids[@]}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${matched_pids[0]}"
 }
 
 echo "using herdr: $HERDR_BIN"
@@ -183,7 +198,13 @@ echo "smoke base: $BASE"
 
 cargo build --locked --manifest-path "$ROOT/Cargo.toml" >/dev/null
 mkdir -p "$CONFIG_HOME/herdr-dev" "$RUNTIME_DIR" "$STATE_DIR"
-printf 'onboarding = false\n' > "$CONFIG_HOME/herdr-dev/config.toml"
+cat > "$CONFIG_HOME/herdr-dev/config.toml" <<'EOF'
+onboarding = false
+
+[terminal]
+default_shell = "/bin/sh"
+shell_mode = "non_login"
+EOF
 
 for session in "${sessions[@]}"; do
   echo "starting smoke session $session at $(api_socket "$session")"
@@ -203,8 +224,10 @@ for session in "${sessions[@]}"; do
   wait_for_http "$port" "hello-from-$session"
 done
 
-before_count="$(smoke_http_count)"
-echo "smoke python http.server process count before handoff: $before_count"
+for port in "${ports[@]}"; do
+  http_pids+=("$(smoke_http_pid "$port")")
+done
+echo "smoke python http.server PIDs before handoff: ${http_pids[*]}"
 
 for session in "${sessions[@]}"; do
   socket="$(api_socket "$session")"
@@ -216,6 +239,12 @@ for i in "${!sessions[@]}"; do
   wait_for_http "${ports[$i]}" "hello-from-${sessions[$i]}"
 done
 
-after_count="$(smoke_http_count)"
-echo "smoke python http.server process count after handoff: $after_count"
+for i in "${!ports[@]}"; do
+  after_pid="$(smoke_http_pid "${ports[$i]}")"
+  if [[ "$after_pid" != "${http_pids[$i]}" ]]; then
+    echo "smoke HTTP server PID changed across handoff on port ${ports[$i]}: ${http_pids[$i]} to $after_pid" >&2
+    exit 1
+  fi
+done
+echo "smoke python http.server PIDs preserved after handoff: ${http_pids[*]}"
 echo "multi-session live handoff smoke passed"

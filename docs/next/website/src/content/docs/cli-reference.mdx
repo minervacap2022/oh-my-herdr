@@ -294,20 +294,29 @@ herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
 herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent broadcast <role> <text>
+herdr agent roster
+herdr agent create <role> --harness codex|pi|claude --cwd <dir> [--instructions-file <path>]
+herdr agent profile <role>
+herdr agent profiles
+herdr agent revive <instance-id> [--tab TAB] [--cwd tab|agent] [--timeout MS]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
 herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]
+herdr agent spawn <role> [--kind KIND] [--tab TAB] [--cwd tab|agent] [--timeout MS] [-- <agent-args...>]
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
 
-Agent targets are either a unique live agent name or the pane ID that currently hosts the agent. Terminal IDs and bare agent-kind labels are not agent targets. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
+Agent targets are either a unique live agent name, a pane ID, or a persistent role target. Use `role@w:t:p` to select one replica and `agent broadcast <role> <text>` to address every live instance of a role. Terminal IDs and bare agent-kind labels are not agent targets. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
 
 `agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `maki`, and `muse`. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Temporary detection uncertainty does not clear it.
 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
+
+`agent create <role> --harness codex|pi|claude --cwd <dir> [--instructions-file <path>]` creates a saved native profile and a session-owned `AGENTS.md` for its durable instructions. `agent profile <role>` shows that profile and the exact instruction-file path; `agent profiles` lists every saved profile. `agent spawn` creates or reuses a persistent role profile and launches it in the selected tab, or the active tab when `--tab` is omitted. The first instance uses the role name; later live instances receive `role-replica-N` names. Herdr uses an available shell immediately or auto-splits the last pane when the target tab has none. After auto-splitting, the request polls for the new shell prompt for up to two seconds before submitting the agent command; if it does not become ready, Herdr rolls back the new pane and returns `agent_spawn_failed`. `--kind` is an explicit per-launch override; without it, spawn uses the saved profile harness (default `codex`). `--cwd tab` uses the target tab directory; `--cwd agent` uses the profile's native directory, seeded on its first spawn. After command submission, spawn may report `launch_pending`; its `--timeout` is a managed detection deadline (3001–300000 milliseconds), not a readiness wait. Use `agent wait <name> --until idle` when readiness matters.
 
 `agent prompt` honors live bracketed-paste mode and sends text followed by encoded Enter after a short delay, including while the agent is working. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, an accepted prompt sent from another non-working state must produce an observed lifecycle change within five seconds or Herdr returns `agent_prompt_stalled`; a caller timeout of five seconds or less keeps the normal `timeout` error. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
 

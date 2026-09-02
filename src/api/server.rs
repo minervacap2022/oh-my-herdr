@@ -29,7 +29,6 @@ pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100)
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -421,7 +420,16 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentSpawn(_) => "agent.spawn",
+        Method::AgentRevive(_) => "agent.revive",
+        Method::AgentRosterList(_) => "agent.roster.list",
+        Method::AgentProfileCreate(_) => "agent.profile.create",
+        Method::AgentProfileSetMd(_) => "agent.profile.set_md",
+        Method::AgentProfileGet(_) => "agent.profile.get",
+        Method::AgentProfileList(_) => "agent.profile.list",
+        Method::AgentProfileSet(_) => "agent.profile.set",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentBroadcast(_) => "agent.broadcast",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -504,7 +512,14 @@ fn read_initial_request_line_with_timeout(
     stream: &mut LocalStream,
     timeout: Duration,
 ) -> std::io::Result<Option<String>> {
-    read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
+    read_initial_request_line_with_limits(stream, timeout, crate::api::MAX_JSON_LINE_BYTES)
+}
+
+fn ensure_initial_request_before_deadline(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out reading api request"))
 }
 
 fn read_initial_request_line_with_limits(
@@ -518,6 +533,10 @@ fn read_initial_request_line_with_limits(
     let mut byte = [0u8; 1];
 
     let result = loop {
+        let remaining = match ensure_initial_request_before_deadline(deadline) {
+            Ok(remaining) => remaining,
+            Err(err) => break Err(err),
+        };
         let read = match poll_local_stream_read(stream, &mut byte) {
             Ok(read) => read,
             Err(err) => break Err(err),
@@ -526,6 +545,9 @@ fn read_initial_request_line_with_limits(
             LocalStreamRead::Closed => break Ok(None),
             LocalStreamRead::Data => {
                 bytes.push(byte[0]);
+                if let Err(err) = ensure_initial_request_before_deadline(deadline) {
+                    break Err(err);
+                }
                 if byte[0] == b'\n' {
                     break String::from_utf8(bytes)
                         .map(Some)
@@ -539,18 +561,60 @@ fn read_initial_request_line_with_limits(
                 }
             }
             LocalStreamRead::Pending => {
-                if Instant::now() >= deadline {
-                    break Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out reading api request",
-                    ));
-                }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                std::thread::sleep(remaining.min(CONNECTION_POLL_INTERVAL));
             }
         }
     };
     set_local_stream_polling(stream, false)?;
     result
+}
+
+#[cfg(test)]
+mod initial_request_tests {
+    use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("h-{name}-{}-{nanos}", std::process::id()));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        (client, server, path)
+    }
+
+    #[test]
+    fn windows_initial_request_deadline_is_not_extended_by_partial_input() {
+        let (mut client, mut server, path) = local_stream_pair("partial-request-deadline");
+        client.write_all(b"x").unwrap();
+        client.flush().unwrap();
+
+        let (start_tx, start_rx) = mpsc::sync_channel(0);
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+            for _ in 0..5 {
+                client.write_all(b"x").unwrap();
+                client.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+        });
+
+        start_tx.send(()).unwrap();
+        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_millis(50))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        writer.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -796,6 +860,60 @@ pub(super) fn dispatch_to_app_with_timeout(
     timeout: Option<Duration>,
 ) -> String {
     dispatch_to_app(request, api_tx, timeout, None, None)
+}
+
+pub(super) fn dispatch_to_app_with_timeout_until_connection_stops(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Duration,
+    stream: &mut LocalStream,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    let request_id = request.id.clone();
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    if let Err(err) = api_tx.send(ApiRequestMessage {
+        request,
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+    }) {
+        return Ok(Some(error_response_json(
+            request_id,
+            "server_unavailable",
+            format!("failed to dispatch request: {err}"),
+        )));
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(Some(error_response_json(
+                request_id,
+                "server_unavailable",
+                format!(
+                    "request handling failed: timed out waiting for app response after {} ms",
+                    timeout.as_millis()
+                ),
+            )));
+        }
+
+        match response_rx.recv_timeout(remaining.min(CONNECTION_POLL_INTERVAL)) {
+            Ok(response) => return Ok(Some(response)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(Some(error_response_json(
+                    request_id,
+                    "server_unavailable",
+                    "request handling failed: app response channel closed".into(),
+                )));
+            }
+        }
+    }
 }
 
 pub(super) fn dispatch_stream_open(
@@ -1256,6 +1374,85 @@ mod tests {
     }
 
     #[test]
+    fn zero_timeout_waits_do_not_dispatch_to_app() {
+        for (name, request) in [
+            (
+                "api-events-wait-zero",
+                br#"{"id":"wait_events","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"blocked"},"timeout_ms":0}}"#
+                    .as_slice(),
+            ),
+            (
+                "api-output-wait-zero",
+                br#"{"id":"wait_output","method":"pane.wait_for_output","params":{"pane_id":"pane_1","source":"recent","match":{"type":"substring","value":"ready"},"timeout_ms":0}}"#
+                    .as_slice(),
+            ),
+            (
+                "api-agent-wait-zero",
+                br#"{"id":"wait_agent","method":"agent.wait","params":{"target":"reviewer","timeout_ms":0}}"#
+                    .as_slice(),
+            ),
+        ] {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server, _path) = local_stream_pair(name);
+            client.write_all(request).unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+
+            handle_connection(
+                server,
+                &api_tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            )
+            .unwrap();
+
+            let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response["error"]["code"], "timeout", "{name}");
+            assert!(api_rx.try_recv().is_err(), "{name} dispatched an app probe");
+        }
+    }
+
+    #[test]
+    fn events_wait_setup_uses_remaining_timeout_not_fixed_app_timeout() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx.blocking_recv().expect("setup probe");
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = message.respond_to.send(
+                serde_json::to_string(&SuccessResponse {
+                    id: message.request.id,
+                    result: ResponseResult::PaneInfo {
+                        pane: pane_info("pane_1", crate::api::schema::AgentStatus::Blocked),
+                    },
+                })
+                .unwrap(),
+            );
+        });
+        let (mut client, server, _path) = local_stream_pair("api-events-wait-budget");
+        client
+            .write_all(br#"{"id":"wait_budget","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"blocked"},"timeout_ms":20}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let started = Instant::now();
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(80));
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["error"]["code"], "timeout");
+        responder.join().unwrap();
+    }
+
+    #[test]
     fn events_wait_agent_status_returns_not_found_when_pane_closes() {
         let event_hub = EventHub::default();
         let responder_event_hub = event_hub.clone();
@@ -1376,6 +1573,175 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_output_stops_when_client_disconnects_during_app_dispatch() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (read_started_tx, read_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx
+                .blocking_recv()
+                .expect("wait dispatches a pane read request");
+            assert!(matches!(message.request.method, Method::PaneRead(_)));
+            read_started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(message);
+        });
+
+        let (mut client, server, _path) = local_stream_pair("wait-drop");
+        client
+            .write_all(br#"{"id":"req_wait_dispatch","method":"pane.wait_for_output","params":{"pane_id":"pane_1","source":"recent","match":{"type":"substring","value":"never"}}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            done_tx.send(result).unwrap();
+        });
+
+        read_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop(client);
+
+        let prompt_result = done_rx.recv_timeout(Duration::from_millis(500));
+        let exited_promptly = prompt_result.is_ok();
+        release_tx.send(()).unwrap();
+        let result = match prompt_result {
+            Ok(result) => result,
+            Err(_) => done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("connection exits after the held app request is released"),
+        };
+        responder.join().unwrap();
+        server_thread.join().unwrap();
+
+        assert!(
+            exited_promptly,
+            "client disconnect must interrupt a wait blocked on the app response: {result:?}"
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn agent_wait_stops_when_client_disconnects_during_app_dispatch() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (read_started_tx, read_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx
+                .blocking_recv()
+                .expect("agent wait dispatches an agent lookup request");
+            assert!(matches!(message.request.method, Method::AgentGet(_)));
+            read_started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(message);
+        });
+
+        let (mut client, server, _path) = local_stream_pair("agent-drop");
+        client
+            .write_all(
+                br#"{"id":"req_agent_wait_dispatch","method":"agent.wait","params":{"target":"reviewer"}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            done_tx.send(result).unwrap();
+        });
+
+        read_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop(client);
+
+        let prompt_result = done_rx.recv_timeout(Duration::from_millis(500));
+        let exited_promptly = prompt_result.is_ok();
+        release_tx.send(()).unwrap();
+        let result = match prompt_result {
+            Ok(result) => result,
+            Err(_) => done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("connection exits after the held app request is released"),
+        };
+        responder.join().unwrap();
+        server_thread.join().unwrap();
+
+        assert!(
+            exited_promptly,
+            "client disconnect must interrupt an agent wait blocked on the app response: {result:?}"
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn events_wait_stops_when_client_disconnects_during_app_dispatch() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (read_started_tx, read_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx
+                .blocking_recv()
+                .expect("event wait dispatches a pane lookup request");
+            assert!(matches!(message.request.method, Method::PaneGet(_)));
+            read_started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(message);
+        });
+
+        let (mut client, server, _path) = local_stream_pair("event-drop");
+        client
+            .write_all(
+                br#"{"id":"req_events_wait_dispatch","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"blocked"}}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            done_tx.send(result).unwrap();
+        });
+
+        read_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop(client);
+
+        let prompt_result = done_rx.recv_timeout(Duration::from_millis(500));
+        let exited_promptly = prompt_result.is_ok();
+        release_tx.send(()).unwrap();
+        let result = match prompt_result {
+            Ok(result) => result,
+            Err(_) => done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("connection exits after the held app request is released"),
+        };
+        responder.join().unwrap();
+        server_thread.join().unwrap();
+
+        assert!(
+            exited_promptly,
+            "client disconnect must interrupt an event wait blocked on the app response: {result:?}"
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn subscriptions_stop_when_client_disconnects() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair("api-sub-disconnect");
@@ -1465,7 +1831,7 @@ mod pane_graphics_request_tests {
         };
         let encoded = serde_json::to_vec(&request).unwrap();
 
-        assert!(encoded.len() < MAX_INITIAL_REQUEST_BYTES);
+        assert!(encoded.len() < crate::api::MAX_JSON_LINE_BYTES);
     }
 
     #[test]

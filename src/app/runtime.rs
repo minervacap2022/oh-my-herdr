@@ -41,9 +41,13 @@ impl App {
     }
 
     pub(crate) fn shutdown_detached_terminal_runtimes(&mut self) {
-        let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
-        for terminal_id in terminal_ids {
-            self.shutdown_terminal_runtime(terminal_id);
+        let shutdowns = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
+        for shutdown in shutdowns {
+            self.terminate_live_roster_instance(
+                shutdown.released_roster_instance_id.as_deref(),
+                shutdown.released_agent_name.as_deref(),
+            );
+            self.shutdown_terminal_runtime(shutdown.terminal_id);
         }
     }
 
@@ -77,10 +81,31 @@ impl App {
             &msg.request.method,
             crate::api::schema::Method::WorktreeCreate(_)
                 | crate::api::schema::Method::WorktreeRemove(_)
+                | crate::api::schema::Method::AgentSpawn(_)
+                | crate::api::schema::Method::AgentRevive(_)
         ) {
             self.drain_all_internal_events();
-            let deferred_changed =
-                self.handle_deferred_worktree_api_request(msg.request, msg.respond_to);
+            let deferred_changed = match msg.request.method {
+                crate::api::schema::Method::AgentSpawn(params) => self
+                    .handle_deferred_agent_spawn_api_request(
+                        msg.request.id,
+                        params,
+                        msg.respond_to,
+                    ),
+                crate::api::schema::Method::AgentRevive(params) => self
+                    .handle_deferred_agent_revive_api_request(
+                        msg.request.id,
+                        params,
+                        msg.respond_to,
+                    ),
+                method => self.handle_deferred_worktree_api_request(
+                    crate::api::schema::Request {
+                        id: msg.request.id,
+                        method,
+                    },
+                    msg.respond_to,
+                ),
+            };
             if !skip_default_workspace {
                 changed |= self.ensure_default_workspace();
             }
@@ -332,10 +357,11 @@ impl App {
             .next_managed_agent_deadline()
             .is_some_and(|deadline| now >= deadline)
         {
-            let panes = self.state.reconcile_managed_agents_at(now);
-            if !panes.is_empty() {
-                for (ws_idx, pane_id) in panes {
-                    self.emit_pane_updated(ws_idx, pane_id);
+            let updates = self.state.reconcile_managed_agents_at(now);
+            if !updates.is_empty() {
+                for update in updates {
+                    self.emit_pane_updated(update.ws_idx, update.pane_id);
+                    self.emit_pane_state_update(&update);
                 }
                 self.schedule_session_save();
                 changed = true;
@@ -386,6 +412,7 @@ impl App {
 
         changed |= self.expire_due_metadata(now);
         changed |= self.handle_tab_bar_status_tasks(now);
+        changed |= self.complete_due_agent_spawns(now);
 
         if geometry_dirty || resized {
             self.pending_agent_resume_deadline = None;
@@ -623,6 +650,7 @@ impl App {
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
+            self.pending_agent_spawn_deadline,
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,

@@ -36,7 +36,7 @@ herdr api schema --output herdr-api.schema.json
 - ワークスペースの作成、一覧、フォーカス、名前変更、クローズ
 - タブの作成、一覧、フォーカス、名前変更、クローズ
 - ペインの一覧、調査、分割、入れ替え、フォーカス、リサイズ、名前変更、読み取り、クローズ、入力送信
-- CLI ヘルパーを通じたエージェントの一覧、調査、読み取り、プロンプト、待機、名前変更、フォーカス、起動、アタッチ
+- CLI ヘルパーを通じたエージェントの一覧、調査、読み取り、プロンプト、待機、名前変更、フォーカス、起動、spawn、アタッチ
 - フックやプラグインからのカスタムエージェント状態の報告
 - イベントの購読と、出力や状態変化の待機
 - 組み込みインテグレーションのインストールとアンインストール
@@ -102,12 +102,19 @@ herdr pane read w1:p2 --source recent --lines 50
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.spawn`、`agent.profile.get`、`agent.profile.list`、`agent.profile.set`、`agent.profile.set_md` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
+
+`agent.spawn` は `role` で指定した永続プロファイルを作成または再利用し、選択したタブ（`tab_id` を省略した場合はアクティブなタブ）で起動して `.result.spawned` を返します。`tab_id` でバックグラウンドのタブを選択してもフォーカスは変わりません。利用可能なシェルを再利用し、なければ最後のペインを自動分割し、後続の live インスタンスには `role-replica-N` を付けます。`cwd_mode` は既定で `tab`、プロファイルの native ディレクトリを使う場合は `agent` です。`agent.profile.create` は codex、pi、claude のプロファイルとセッション専用 `AGENTS.md` を作成します。Codex は `model_instructions_file`、Pi/Claude はネイティブの prompt-file 引数で注入します。`agent.profile.get`、`agent.profile.list`、`agent.profile.set`、`agent.profile.set_md` でプロファイルを読み書きできます。spawn は Claude、Codex、Pi に model と effort を適用し、Claude と Pi に allowlist を適用します。`apikey_ref` は Claude と Codex で `env:NAME` の環境変数参照として使われます。対応しない設定は黙って無視せず失敗します。
+
+```json
+{"id":"spawn-reviewer","method":"agent.spawn","params":{"role":"reviewer","kind":"claude","cwd_mode":"tab","timeout_ms":30000}}
+{"id":"profile-context","method":"agent.profile.set_md","params":{"role":"reviewer","name":"context.md","path":"/workspace/context.md"}}
+```
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
 
@@ -638,6 +645,8 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 ```
 
 最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。ライフサイクルイベントの購読はリクエストが受理された時点から始まり、それ以前に保持されていたイベントは再生しません。
+
+購読クライアントはソケットを継続的に読み取る必要があります。Herdr は接続ごとの信頼性制御キューを上限付きにしており、そのキューが満杯になるとクライアント接続を退役させます。退役した接続の後は、再接続して再度購読してください。
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。

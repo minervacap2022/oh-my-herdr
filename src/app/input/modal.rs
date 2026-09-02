@@ -373,6 +373,9 @@ pub(super) fn open_rename_workspace(
     ws_idx: usize,
 ) {
     state.pending_workspace_create_cwd = None;
+    state.workspace_create_cwd_input.clear();
+    state.workspace_create_cwd_editing = false;
+    state.workspace_create_cwd_replace_on_type = false;
     state.selected = ws_idx;
     state.rename_pane_target = None;
     state.name_input =
@@ -381,11 +384,15 @@ pub(super) fn open_rename_workspace(
     state.mode = Mode::RenameWorkspace;
 }
 
-pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::PathBuf) {
+pub(crate) fn open_new_workspace_dialog(state: &mut AppState) {
+    let cwd = crate::worktree::expand_tilde_path("~");
     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
+    state.workspace_create_cwd_input = "~".to_string();
+    state.workspace_create_cwd_editing = false;
+    state.workspace_create_cwd_replace_on_type = true;
     state.rename_pane_target = None;
     state.name_input = suggested_name;
     state.name_input_replace_on_type = true;
@@ -396,6 +403,9 @@ pub(super) fn open_rename_active_tab(state: &mut AppState, replace_on_type: bool
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
+    state.workspace_create_cwd_input.clear();
+    state.workspace_create_cwd_editing = false;
+    state.workspace_create_cwd_replace_on_type = false;
     state.rename_pane_target = None;
     if let Some(ws) = state.active.and_then(|i| state.workspaces.get(i)) {
         if let Some(name) = ws.active_tab_display_name() {
@@ -417,6 +427,9 @@ pub(super) fn open_rename_pane(state: &mut AppState, pane_id: crate::layout::Pan
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
+    state.workspace_create_cwd_input.clear();
+    state.workspace_create_cwd_editing = false;
+    state.workspace_create_cwd_replace_on_type = false;
     state.rename_pane_target = Some(pane_id);
     state.name_input = terminal
         .and_then(|t| t.manual_label.clone())
@@ -428,6 +441,11 @@ pub(super) fn open_rename_pane(state: &mut AppState, pane_id: crate::layout::Pan
 fn workspace_create_label(input: &str, suggested_name: &str) -> Option<String> {
     let name = input.trim();
     (!name.is_empty() && name != suggested_name).then(|| name.to_string())
+}
+
+fn workspace_create_cwd_path(input: &str) -> std::path::PathBuf {
+    let value = input.trim();
+    crate::worktree::expand_tilde_path(if value.is_empty() { "~" } else { value })
 }
 
 fn next_new_tab_default_name(state: &AppState) -> String {
@@ -442,6 +460,9 @@ pub(super) fn open_new_tab_dialog(state: &mut AppState) {
     state.creating_new_tab = true;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
+    state.workspace_create_cwd_input.clear();
+    state.workspace_create_cwd_editing = false;
+    state.workspace_create_cwd_replace_on_type = false;
     state.rename_pane_target = None;
     state.name_input = next_new_tab_default_name(state);
     state.name_input_replace_on_type = true;
@@ -582,19 +603,24 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             }
             state.creating_new_tab = false;
             state.pending_workspace_create_cwd = None;
+            state.workspace_create_cwd_input.clear();
+            state.workspace_create_cwd_editing = false;
+            state.workspace_create_cwd_replace_on_type = false;
             state.rename_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
             leave_modal(state);
         }
         ModalAction::Clear => {
-            state.name_input.clear();
-            state.name_input_replace_on_type = false;
+            clear_rename_input(state);
         }
         ModalAction::Cancel => {
             state.creating_new_tab = false;
             state.requested_new_tab_name = None;
             state.pending_workspace_create_cwd = None;
+            state.workspace_create_cwd_input.clear();
+            state.workspace_create_cwd_editing = false;
+            state.workspace_create_cwd_replace_on_type = false;
             state.rename_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
@@ -605,22 +631,42 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
 }
 
 fn clear_rename_input(state: &mut AppState) {
-    state.name_input.clear();
-    state.name_input_replace_on_type = false;
+    if workspace_create_cwd_input_is_active(state) {
+        state.workspace_create_cwd_input.clear();
+        state.workspace_create_cwd_replace_on_type = false;
+    } else {
+        state.name_input.clear();
+        state.name_input_replace_on_type = false;
+    }
 }
 
 pub(crate) fn insert_rename_input_text(state: &mut AppState, text: &str) {
-    if state.name_input_replace_on_type {
-        clear_rename_input(state);
+    if workspace_create_cwd_input_is_active(state) {
+        if state.workspace_create_cwd_replace_on_type {
+            clear_rename_input(state);
+        }
+        state.workspace_create_cwd_input.push_str(text);
+    } else {
+        if state.name_input_replace_on_type {
+            clear_rename_input(state);
+        }
+        state.name_input.push_str(text);
     }
-    state.name_input.push_str(text);
 }
 
 fn delete_rename_input_char(state: &mut AppState) {
-    if state.name_input_replace_on_type {
-        clear_rename_input(state);
+    if workspace_create_cwd_input_is_active(state) {
+        if state.workspace_create_cwd_replace_on_type {
+            clear_rename_input(state);
+        } else {
+            state.workspace_create_cwd_input.pop();
+        }
     } else {
-        state.name_input.pop();
+        if state.name_input_replace_on_type {
+            clear_rename_input(state);
+        } else {
+            state.name_input.pop();
+        }
     }
 }
 
@@ -638,41 +684,53 @@ fn rename_word_delete_class(ch: char) -> RenameWordDeleteClass {
     }
 }
 
-fn delete_rename_input_word(state: &mut AppState) {
-    if state.name_input_replace_on_type {
-        clear_rename_input(state);
-        return;
+fn delete_input_word(input: &mut String) {
+    while input.chars().last().is_some_and(char::is_whitespace) {
+        input.pop();
     }
 
-    while state
-        .name_input
-        .chars()
-        .last()
-        .is_some_and(char::is_whitespace)
-    {
-        state.name_input.pop();
-    }
-
-    let Some(class) = state
-        .name_input
-        .chars()
-        .last()
-        .map(rename_word_delete_class)
-    else {
+    let Some(class) = input.chars().last().map(rename_word_delete_class) else {
         return;
     };
 
-    while state
-        .name_input
+    while input
         .chars()
         .last()
         .is_some_and(|ch| !ch.is_whitespace() && rename_word_delete_class(ch) == class)
     {
-        state.name_input.pop();
+        input.pop();
+    }
+}
+
+fn workspace_create_cwd_input_is_active(state: &AppState) -> bool {
+    state.pending_workspace_create_cwd.is_some() && state.workspace_create_cwd_editing
+}
+
+fn delete_rename_input_word(state: &mut AppState) {
+    if workspace_create_cwd_input_is_active(state) {
+        if state.workspace_create_cwd_replace_on_type {
+            clear_rename_input(state);
+        } else {
+            delete_input_word(&mut state.workspace_create_cwd_input);
+        }
+    } else if state.name_input_replace_on_type {
+        clear_rename_input(state);
+    } else {
+        delete_input_word(&mut state.name_input);
     }
 }
 
 fn handle_rename_edit_key(state: &mut AppState, key: KeyEvent) {
+    if state.pending_workspace_create_cwd.is_some()
+        && matches!(
+            key.code,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+        )
+    {
+        state.workspace_create_cwd_editing = !state.workspace_create_cwd_editing;
+        return;
+    }
+
     match key.code {
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             clear_rename_input(state);
@@ -851,6 +909,12 @@ pub(super) fn apply_context_menu_action(
             open_rename_pane(state, pane_id);
         }
         (
+            ContextMenuKind::AgentProfileSpawn { .. },
+            Some("Use space cwd" | "Use agent native cwd"),
+        ) => {
+            leave_modal(state);
+        }
+        (
             ContextMenuKind::Pane {
                 ws_idx, pane_id, ..
             },
@@ -1017,7 +1081,8 @@ impl App {
 
         match self.state.mode {
             Mode::RenameWorkspace => {
-                if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
+                if self.state.pending_workspace_create_cwd.take().is_some() {
+                    let cwd = workspace_create_cwd_path(&self.state.workspace_create_cwd_input);
                     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
                     let label = workspace_create_label(&new_name, &suggested_name);
                     self.runtime_workspace_create(
@@ -1107,10 +1172,7 @@ impl App {
     pub(super) fn apply_rename_mouse_action_via_api(&mut self, action: ModalAction) {
         match action {
             ModalAction::Save => self.save_rename_modal_via_api(),
-            ModalAction::Clear => {
-                self.state.name_input.clear();
-                self.state.name_input_replace_on_type = false;
-            }
+            ModalAction::Clear => clear_rename_input(&mut self.state),
             ModalAction::Cancel => cancel_rename_modal(&mut self.state),
             _ => {}
         }
@@ -1272,6 +1334,14 @@ impl App {
             (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
                 open_rename_pane(&mut self.state, pane_id);
             }
+            (ContextMenuKind::AgentProfileSpawn { role, ws_idx }, Some("Use space cwd")) => {
+                self.spawn_agent_profile_in_workspace_via_api(role, Some(ws_idx), "tab");
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::AgentProfileSpawn { role, ws_idx }, Some("Use agent native cwd")) => {
+                self.spawn_agent_profile_in_workspace_via_api(role, Some(ws_idx), "agent");
+                leave_modal(&mut self.state);
+            }
             (
                 ContextMenuKind::Pane {
                     ws_idx, pane_id, ..
@@ -1391,6 +1461,9 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
+    state.workspace_create_cwd_input.clear();
+    state.workspace_create_cwd_editing = false;
+    state.workspace_create_cwd_replace_on_type = false;
     state.rename_pane_target = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
@@ -1462,6 +1535,35 @@ mod tests {
             workspace_create_label("  logs  ", "project").as_deref(),
             Some("logs")
         );
+    }
+
+    #[test]
+    fn new_workspace_dialog_edits_native_cwd_separately_and_defaults_to_home() {
+        let mut state = AppState::test_new();
+        open_new_workspace_dialog(&mut state);
+
+        assert_eq!(state.workspace_create_cwd_input, "~");
+        assert!(!state.workspace_create_cwd_editing);
+        assert_eq!(
+            workspace_create_cwd_path(""),
+            crate::worktree::expand_tilde_path("~")
+        );
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        insert_rename_input_text(&mut state, "/workspace/project");
+        assert!(state.workspace_create_cwd_editing);
+        assert_eq!(state.workspace_create_cwd_input, "/workspace/project");
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        insert_rename_input_text(&mut state, "project");
+        assert!(!state.workspace_create_cwd_editing);
+        assert_eq!(state.name_input, "project");
     }
 
     fn mark_worktree_space_member(state: &mut AppState, ws_idx: usize, key: &str) {
@@ -2258,6 +2360,26 @@ mod tests {
                 .unwrap()
                 .right_click_passthrough
         );
+    }
+
+    #[test]
+    fn agent_profile_spawn_menu_action_leaves_modal() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::AgentProfileSpawn {
+                role: "ccc".into(),
+                ws_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 0);
+
+        assert_eq!(state.mode, Mode::Terminal);
     }
 
     #[test]

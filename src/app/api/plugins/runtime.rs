@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::process::Stdio;
 
 use super::manifest::{effective_platforms, ensure_platform_supported};
@@ -7,8 +6,12 @@ use crate::api::schema::{
     InstalledPluginInfo, PluginCommandLogInfo, PluginCommandStatus, PluginInvocationContext,
 };
 use crate::app::App;
+pub(super) use crate::plugin_command::read_capped_plugin_output;
+use crate::plugin_command::{
+    current_unix_ms, PluginCommandRunnerResult, PluginCommandRunnerSpec,
+    PLUGIN_COMMAND_OUTPUT_MAX_BYTES,
+};
 
-const PLUGIN_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_PLUGIN_COMMANDS_IN_FLIGHT: usize = 32;
 const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
 
@@ -79,28 +82,8 @@ impl App {
                 link_handler_id.clone(),
             ));
         }
-        if self.state.plugin_commands_in_flight >= MAX_PLUGIN_COMMANDS_IN_FLIGHT {
-            let message = format!(
-                "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
-            );
-            let log = PluginCommandLogInfo {
-                log_id,
-                plugin_id: plugin.plugin_id.clone(),
-                action_id,
-                event,
-                command,
-                status: PluginCommandStatus::Failed,
-                started_unix_ms,
-                finished_unix_ms: Some(started_unix_ms),
-                exit_code: None,
-                stdout: Some(String::new()),
-                stderr: Some(String::new()),
-                error: Some(message.clone()),
-            };
-            self.push_plugin_command_log(log);
-            return Err(("plugin_command_limit_reached", message));
-        }
-        let plugin_root = std::path::PathBuf::from(&plugin.plugin_root);
+        let plugin_root =
+            crate::worktree::canonical_or_original(std::path::Path::new(&plugin.plugin_root));
         let log = PluginCommandLogInfo {
             log_id: log_id.clone(),
             plugin_id: plugin.plugin_id.clone(),
@@ -115,16 +98,122 @@ impl App {
             stderr: None,
             error: None,
         };
+        if self.no_session && self.state.plugin_commands_in_flight >= MAX_PLUGIN_COMMANDS_IN_FLIGHT
+        {
+            return self.reject_plugin_command(
+                log,
+                "plugin_command_limit_reached",
+                format!(
+                    "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
+                ),
+            );
+        }
+
+        if !self.no_session {
+            let lease_id = match crate::persist::plugin_command_leases::acquire(
+                plugin_root.clone(),
+                MAX_PLUGIN_COMMANDS_IN_FLIGHT,
+            ) {
+                Ok(lease_id) => lease_id,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    return self.reject_plugin_command(
+                        log,
+                        "plugin_command_limit_reached",
+                        format!(
+                            "maximum concurrent plugin commands reached ({MAX_PLUGIN_COMMANDS_IN_FLIGHT})"
+                        ),
+                    );
+                }
+                Err(err) => {
+                    return self.reject_plugin_command(
+                        log,
+                        "plugin_command_lease_failed",
+                        format!("failed to reserve plugin command lease: {err}"),
+                    );
+                }
+            };
+            let runner = crate::plugin_command::spawn_runner(&PluginCommandRunnerSpec {
+                lease_id: lease_id.clone(),
+                program,
+                args,
+                cwd: plugin_root,
+                env,
+            });
+            let runner = match runner {
+                Ok(runner) => runner,
+                Err(err) => {
+                    if let Err(release_err) =
+                        crate::persist::plugin_command_leases::release(&lease_id)
+                    {
+                        tracing::error!(
+                            lease_id,
+                            err = %release_err,
+                            "failed to release plugin command lease after runner launch failure"
+                        );
+                    }
+                    return self.reject_plugin_command(
+                        log,
+                        "plugin_command_start_failed",
+                        format!("failed to start plugin command runner: {err}"),
+                    );
+                }
+            };
+            self.push_plugin_command_log(log.clone());
+            self.state.plugin_commands_in_flight += 1;
+            let event_tx = self.event_tx.clone();
+            std::thread::spawn(move || {
+                let finished = match runner.wait_with_output() {
+                    Ok(output) => {
+                        match serde_json::from_slice::<PluginCommandRunnerResult>(&output.stdout) {
+                            Ok(result) => crate::events::AppEvent::PluginCommandFinished {
+                                log_id,
+                                finished_unix_ms: result.finished_unix_ms,
+                                exit_code: result.exit_code,
+                                stdout: result.stdout,
+                                stderr: result.stderr,
+                                error: result.error,
+                            },
+                            Err(err) => crate::events::AppEvent::PluginCommandFinished {
+                                log_id,
+                                finished_unix_ms: current_unix_ms(),
+                                exit_code: output.status.code(),
+                                stdout: String::new(),
+                                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                                error: Some(format!(
+                                    "plugin command runner returned an invalid result: {err}"
+                                )),
+                            },
+                        }
+                    }
+                    Err(err) => crate::events::AppEvent::PluginCommandFinished {
+                        log_id,
+                        finished_unix_ms: current_unix_ms(),
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(format!("failed to wait for plugin command runner: {err}")),
+                    },
+                };
+                let _ = event_tx.blocking_send(finished);
+            });
+            return Ok(log);
+        }
+
         self.push_plugin_command_log(log.clone());
         self.state.plugin_commands_in_flight += 1;
+        self.acquire_plugin_command_root_lease(log_id.clone(), plugin_root.clone());
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let child =
-                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
-                    .envs(env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn();
+            let child = crate::plugin_command::command_for_plugin_argv_in_dir(
+                &program,
+                &args,
+                &plugin_root,
+                &env,
+            )
+            .envs(env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
             let finished = match child {
                 Ok(mut child) => {
                     let stdout = child.stdout.take();
@@ -178,6 +267,67 @@ impl App {
             let _ = event_tx.blocking_send(finished);
         });
         Ok(log)
+    }
+
+    fn acquire_plugin_command_root_lease(
+        &mut self,
+        log_id: String,
+        plugin_root: std::path::PathBuf,
+    ) {
+        let count = self
+            .state
+            .plugin_command_root_leases
+            .entry(plugin_root.clone())
+            .or_default();
+        *count = count.saturating_add(1);
+        self.state
+            .plugin_command_lease_roots
+            .insert(log_id, plugin_root);
+    }
+
+    pub(crate) fn release_plugin_command_root_lease(&mut self, log_id: &str) {
+        let Some(plugin_root) = self.state.plugin_command_lease_roots.remove(log_id) else {
+            return;
+        };
+        let Some(count) = self.state.plugin_command_root_leases.get_mut(&plugin_root) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.state.plugin_command_root_leases.remove(&plugin_root);
+        }
+    }
+
+    fn reject_plugin_command(
+        &mut self,
+        mut log: PluginCommandLogInfo,
+        code: &'static str,
+        message: String,
+    ) -> Result<PluginCommandLogInfo, (&'static str, String)> {
+        log.status = PluginCommandStatus::Failed;
+        log.finished_unix_ms = Some(log.started_unix_ms);
+        log.stdout = Some(String::new());
+        log.stderr = Some(String::new());
+        log.error = Some(message.clone());
+        self.push_plugin_command_log(log);
+        Err((code, message))
+    }
+
+    pub(crate) fn leased_plugin_root_within(
+        &self,
+        checkout_path: &std::path::Path,
+    ) -> std::io::Result<Option<std::path::PathBuf>> {
+        if !self.no_session {
+            return crate::persist::plugin_command_leases::active_root_within(checkout_path);
+        }
+        let checkout_path = crate::worktree::canonical_or_original(checkout_path);
+        Ok(self
+            .state
+            .plugin_command_root_leases
+            .iter()
+            .find_map(|(plugin_root, count)| {
+                (*count > 0 && plugin_root.starts_with(&checkout_path)).then(|| plugin_root.clone())
+            }))
     }
 
     pub(crate) fn run_plugin_startup_hooks(&mut self) {
@@ -272,40 +422,4 @@ impl App {
             self.state.plugin_command_logs.drain(0..extra);
         }
     }
-}
-
-fn current_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> String {
-    let mut kept = Vec::with_capacity(cap.min(8192));
-    let mut buf = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let remaining = cap.saturating_sub(kept.len());
-                if remaining > 0 {
-                    kept.extend_from_slice(&buf[..n.min(remaining)]);
-                }
-                if n > remaining {
-                    truncated = true;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
-    let mut output = String::from_utf8_lossy(&kept).into_owned();
-    if truncated {
-        output.push_str(&format!(
-            "\n[herdr truncated plugin output after {cap} bytes]"
-        ));
-    }
-    output
 }

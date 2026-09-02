@@ -76,6 +76,24 @@ impl App {
         &self,
         target: &str,
     ) -> Result<TerminalTarget, TerminalTargetError> {
+        // `role@pane` is the stable, human-facing disambiguator for replicas.
+        // The pane component is the public pane id, so it survives process
+        // renames while remaining easy to copy from `agent.list`.
+        if let Some((role, pane)) = target.rsplit_once('@') {
+            let matches = self
+                .agent_targets_for_role(role)
+                .into_iter()
+                .filter(|candidate| {
+                    self.public_pane_id(candidate.ws_idx, candidate.pane_id)
+                        .as_deref()
+                        == Some(pane)
+                })
+                .collect();
+            if let Some(resolved) = self.single_terminal_match(target, matches)? {
+                return Ok(resolved);
+            }
+        }
+
         if let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(target) {
             if let Some(resolved) = self
                 .terminal_target_for_pane(ws_idx, pane_id)
@@ -83,6 +101,11 @@ impl App {
             {
                 return Ok(resolved);
             }
+        }
+
+        let role_matches = self.agent_targets_for_role(target);
+        if let Some(resolved) = self.single_terminal_match(target, role_matches)? {
+            return Ok(resolved);
         }
 
         let name_matches: Vec<_> = self
@@ -103,6 +126,17 @@ impl App {
         Err(TerminalTargetError::NotFound {
             target: target.to_string(),
         })
+    }
+
+    pub(crate) fn agent_targets_for_role(&self, role: &str) -> Vec<TerminalTarget> {
+        self.agent_registry
+            .alive_by_role(role)
+            .iter()
+            .filter_map(|entry| entry.last_pane.as_deref())
+            .filter_map(|pane| self.parse_current_public_pane_id(pane))
+            .filter_map(|(ws_idx, pane_id)| self.terminal_target_for_pane(ws_idx, pane_id))
+            .filter(|candidate| self.target_is_agent(candidate))
+            .collect()
     }
 
     fn target_is_agent(&self, target: &TerminalTarget) -> bool {

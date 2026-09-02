@@ -1513,7 +1513,7 @@ fn send_server_update_method_at(
     method: crate::api::schema::Method,
     error_prefix: &str,
 ) -> Result<(), String> {
-    use crate::api::schema::Request;
+    use crate::api::schema::{Request, ResponseResult, SuccessResponse};
 
     let request = Request {
         id: request_id.into(),
@@ -1522,12 +1522,14 @@ fn send_server_update_method_at(
 
     let mut stream = crate::ipc::connect_local_stream(socket_path)
         .map_err(|e| format!("failed to connect to running server: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    let write_timeout = deadline.saturating_duration_since(Instant::now());
+    if write_timeout.is_zero() {
+        return Err(format!("{error_prefix} request timed out before sending"));
+    }
     stream
-        .set_send_timeout(Some(timeout))
+        .set_send_timeout(Some(write_timeout))
         .map_err(|e| format!("failed to set {error_prefix} write timeout: {e}"))?;
-    stream
-        .set_recv_timeout(Some(timeout))
-        .map_err(|e| format!("failed to set {error_prefix} read timeout: {e}"))?;
     stream
         .write_all(
             serde_json::to_string(&request)
@@ -1542,11 +1544,18 @@ fn send_server_update_method_at(
         .flush()
         .map_err(|e| format!("failed to flush {error_prefix} request: {e}"))?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = crate::ipc::DeadlineLocalStreamReader::new(
+        &mut stream,
+        deadline,
+        "timed out waiting for server update acknowledgement",
+    )
+    .map_err(|e| format!("failed to read {error_prefix} response: {e}"))?;
     let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
-        .map_err(|e| format!("failed to read {error_prefix} response: {e}"))?;
+    let read_result = BufReader::new(&mut reader).read_line(&mut line);
+    reader
+        .restore_stream_mode()
+        .map_err(|e| format!("failed to restore {error_prefix} stream mode: {e}"))?;
+    let read = read_result.map_err(|e| format!("failed to read {error_prefix} response: {e}"))?;
     if read == 0 || line.trim().is_empty() {
         return Err(format!("empty {error_prefix} response"));
     }
@@ -1554,6 +1563,19 @@ fn send_server_update_method_at(
         serde_json::from_str(&line).map_err(|e| format!("invalid server response: {e}"))?;
     if let Some(error) = response.get("error") {
         return Err(format!("{error_prefix} failed: {error}"));
+    }
+    let response: SuccessResponse = serde_json::from_value(response)
+        .map_err(|e| format!("invalid {error_prefix} response: {e}"))?;
+    if response.id != request_id {
+        return Err(format!(
+            "{error_prefix} response id mismatch: expected {request_id:?}, got {:?}",
+            response.id
+        ));
+    }
+    if !matches!(response.result, ResponseResult::Ok {}) {
+        return Err(format!(
+            "{error_prefix} returned an unexpected response result"
+        ));
     }
 
     Ok(())
@@ -3119,7 +3141,7 @@ mod tests {
                     || request.contains("ServerStop")
             );
             stream
-                .write_all(b"{\"id\":\"update:server:stop\",\"result\":{}}\n")
+                .write_all(b"{\"id\":\"update:server:stop\",\"result\":{\"type\":\"ok\"}}\n")
                 .unwrap();
             stream.flush().unwrap();
         });
@@ -3145,7 +3167,9 @@ mod tests {
                 .unwrap();
             assert!(request.contains("server.live_handoff"));
             stream
-                .write_all(b"{\"id\":\"update:server:live-handoff\",\"result\":{}}\n")
+                .write_all(
+                    b"{\"id\":\"update:server:live-handoff\",\"result\":{\"type\":\"ok\"}}\n",
+                )
                 .unwrap();
             stream.flush().unwrap();
         });
@@ -3175,7 +3199,9 @@ mod tests {
             assert_eq!(value["params"]["expected_protocol"], 77);
             assert_eq!(value["params"]["expected_version"], "9.8.7");
             stream
-                .write_all(b"{\"id\":\"update:server:live-handoff\",\"result\":{}}\n")
+                .write_all(
+                    b"{\"id\":\"update:server:live-handoff\",\"result\":{\"type\":\"ok\"}}\n",
+                )
                 .unwrap();
             stream.flush().unwrap();
         });
@@ -3222,6 +3248,70 @@ mod tests {
                 || err.contains("empty server stop response"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn stop_server_via_api_rejects_mismatched_success_response_id() {
+        let socket_path = unique_test_socket_path("stop-wrong-id");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            stream
+                .write_all(b"{\"id\":\"wrong\",\"result\":{\"type\":\"ok\"}}\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let result = stop_server_via_api_at(&socket_path, Duration::from_millis(200));
+
+        let _ = handle.join();
+        let _ = fs::remove_file(&socket_path);
+        assert!(
+            result.is_err(),
+            "wrong response ID must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_server_via_api_rejects_response_that_trickles_past_deadline() {
+        let socket_path = unique_test_socket_path("stop-trickle");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            for byte in b"{\"id\":\"update:server:stop\",\"result\":{\"type\":\"ok\"}}\n" {
+                thread::sleep(Duration::from_millis(15));
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                if stream.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        let timeout = Duration::from_millis(50);
+        let deadline = timeout + Duration::from_millis(250);
+        let started = Instant::now();
+
+        let result = stop_server_via_api_at(&socket_path, timeout);
+
+        assert!(
+            result.is_err(),
+            "trickled response must be rejected: {result:?}"
+        );
+        assert!(
+            started.elapsed() <= deadline,
+            "trickled update response exceeded the {deadline:?} total deadline"
+        );
+        let _ = handle.join();
+        let _ = fs::remove_file(&socket_path);
     }
 
     #[test]

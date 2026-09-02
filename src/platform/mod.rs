@@ -54,6 +54,14 @@ pub(crate) fn configure_background_command(command: &mut std::process::Command) 
 #[cfg(not(windows))]
 fn configure_background_command_platform(_command: &mut std::process::Command) {}
 
+#[cfg(not(windows))]
+pub(crate) fn replace_file(
+    replacement: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(replacement, target)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlatformCapabilities {
     pub(crate) live_handoff: bool,
@@ -199,13 +207,15 @@ pub(crate) struct RemoteSshConfigPaths {
 #[cfg(unix)]
 mod unix_common;
 #[cfg(unix)]
-pub(crate) use unix_common::{begin_cli_output, end_cli_output};
+pub(crate) use unix_common::cli_output_guard;
 
 #[cfg(not(unix))]
-pub(crate) fn begin_cli_output() {}
+pub(crate) struct CliOutputGuard;
 
 #[cfg(not(unix))]
-pub(crate) fn end_cli_output() {}
+pub(crate) fn cli_output_guard() -> CliOutputGuard {
+    CliOutputGuard
+}
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -259,11 +269,19 @@ pub(crate) fn is_powershell_process_name(name: &str) -> bool {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_nushell_process_name(name: &str) -> bool {
+    normalized_process_name(name) == "nu"
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn interactive_unix_shell_command(
     argv: &[String],
     shell_name: &str,
     quote_posix_arg: fn(&str) -> String,
 ) -> Option<String> {
+    if is_nushell_process_name(shell_name) {
+        return interactive_nushell_command(argv);
+    }
     let quote = if is_powershell_process_name(shell_name) {
         quote_powershell_arg
     } else {
@@ -276,6 +294,89 @@ pub(crate) fn interactive_unix_shell_command(
         command.push_str(&quote(part));
     }
     Some(command)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn interactive_unix_shell_command_in_cwd(
+    argv: &[String],
+    shell_name: &str,
+    cwd: &std::path::Path,
+    quote_posix_arg: fn(&str) -> String,
+) -> Option<String> {
+    let command = interactive_unix_shell_command(argv, shell_name, quote_posix_arg)?;
+    let cwd = cwd.to_str()?;
+    if is_nushell_process_name(shell_name) {
+        Some(format!("cd {}; {command}", quote_nushell_arg(cwd)))
+    } else if is_powershell_process_name(shell_name) {
+        Some(format!(
+            "Set-Location -LiteralPath {}; {command}",
+            quote_powershell_arg(cwd)
+        ))
+    } else {
+        Some(format!("cd -- {} && {command}", quote_posix_arg(cwd)))
+    }
+}
+
+/// Build a cwd-scoped interactive command which maps one already-exported
+/// environment variable onto the variable expected by the launched harness.
+/// The command contains only variable names, never the referenced secret.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn interactive_unix_shell_command_with_env_in_cwd(
+    argv: &[String],
+    shell_name: &str,
+    cwd: &std::path::Path,
+    target_env: &str,
+    source_env: &str,
+    quote_posix_arg: fn(&str) -> String,
+) -> Option<String> {
+    let command = interactive_unix_shell_command(argv, shell_name, quote_posix_arg)?;
+    let cwd = cwd.to_str()?;
+    if is_nushell_process_name(shell_name) {
+        // Nushell has no stable syntax for a dynamically named scoped env
+        // binding across the versions Herdr supports.
+        return None;
+    }
+    if is_powershell_process_name(shell_name) {
+        return Some(format!(
+            "Set-Location -LiteralPath {}; & {{ $env:{target_env} = $env:{source_env}; {command} }}",
+            quote_powershell_arg(cwd)
+        ));
+    }
+    Some(format!(
+        "cd -- {} && {target_env}=\"${{{source_env}}}\" {command}",
+        quote_posix_arg(cwd)
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn interactive_nushell_command(argv: &[String]) -> Option<String> {
+    let executable = argv.first()?;
+    if executable.is_empty()
+        || !executable
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+    {
+        return None;
+    }
+
+    let mut command = format!("^{executable}");
+    for argument in &argv[1..] {
+        command.push(' ');
+        command.push_str(&quote_nushell_arg(argument));
+    }
+    Some(command)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_nushell_arg(value: &str) -> String {
+    let hash_count = value
+        .split('\'')
+        .skip(1)
+        .map(|suffix| suffix.bytes().take_while(|byte| *byte == b'#').count())
+        .max()
+        .map_or(0, |count| count + 1);
+    let hashes = "#".repeat(hash_count);
+    format!("r{hashes}'{value}'{hashes}")
 }
 
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
@@ -465,6 +566,65 @@ mod tests {
         assert_eq!(
             interactive_shell_command(&argv, "pwsh").as_deref(),
             Some("pi '' 'two words' 'a''b' '$HOME' 'semi;colon' '@options'")
+        );
+        assert_eq!(
+            interactive_shell_command(&argv, "nu").as_deref(),
+            Some("^pi r'' r'two words' r#'a'b'# r'$HOME' r'semi;colon' r'@options'")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn profile_key_reference_uses_shell_indirection_not_a_secret_value() {
+        let command = interactive_unix_shell_command_with_env_in_cwd(
+            &["claude".into(), "--model".into(), "sonnet".into()],
+            "zsh",
+            std::path::Path::new("/tmp/profile cwd"),
+            "ANTHROPIC_API_KEY",
+            "REVIEWER_API_KEY",
+            |value| format!("'{value}'"),
+        );
+        assert_eq!(
+            command.as_deref(),
+            Some(
+                "cd -- '/tmp/profile cwd' && ANTHROPIC_API_KEY=\"${REVIEWER_API_KEY}\" 'claude' '--model' 'sonnet'"
+            )
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_nushell_command_uses_a_safe_raw_delimiter_and_cwd_prologue() {
+        let argv = vec!["claude".into(), "contains '# delimiter".into()];
+        assert_eq!(
+            interactive_shell_command_in_cwd(
+                &argv,
+                "nu",
+                std::path::Path::new("/tmp/agent's cwd"),
+            )
+            .as_deref(),
+            Some("cd r#'/tmp/agent's cwd'#; ^claude r##'contains '# delimiter'##")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn quote_nushell_arg_uses_minimal_safe_delimiter_for_utf8() {
+        assert_eq!(quote_nushell_arg(""), "r''");
+        assert_eq!(quote_nushell_arg("plain 🦀"), "r'plain 🦀'");
+        assert_eq!(quote_nushell_arg("雪'##🦀'#終"), "r###'雪'##🦀'#終'###");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn quote_nushell_arg_handles_a_long_quote_hash_run() {
+        const HASH_RUN: usize = 16 * 1024;
+
+        let value = format!("'{}", "#".repeat(HASH_RUN));
+        let delimiter = "#".repeat(HASH_RUN + 1);
+        assert_eq!(
+            quote_nushell_arg(&value),
+            format!("r{delimiter}'{value}'{delimiter}")
         );
     }
 

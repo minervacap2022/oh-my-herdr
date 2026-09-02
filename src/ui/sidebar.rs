@@ -20,6 +20,7 @@ use crate::terminal::TerminalRuntimeRegistry;
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 
+#[derive(Clone)]
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
     pub tab_idx: usize,
@@ -37,6 +38,11 @@ pub(crate) struct AgentPanelEntry {
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
+    /// Set for a persistent profile card that has no live pane yet (or is a
+    /// deliberate replica affordance). The existing pane fields remain valid
+    /// so filtering, layout, and token rendering stay on one path.
+    pub saved_profile_role: Option<String>,
+    pub profile_native_cwd: Option<String>,
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -87,6 +93,18 @@ fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
 
 pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect {
     agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
+}
+
+/// The sidebar's fast path for creating a persistent native agent profile.
+/// It deliberately shares the Agents header with the existing sort control so
+/// creating a profile is as immediate as creating a workspace.
+pub(crate) fn agent_panel_new_button_rect(app: &AppState, area: Rect) -> Rect {
+    if area.width == 0 || area.height <= AGENT_PANEL_HEADER_ROWS {
+        return Rect::default();
+    }
+    let _ = app;
+    let footer_y = area.y + area.height.saturating_sub(1);
+    Rect::new(area.x, footer_y, 5.min(area.width), 1)
 }
 
 fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
@@ -146,7 +164,35 @@ fn collect_agent_panel_entries_with_runtimes(
         }
     };
 
-    app.workspaces
+    let profile_entries = app
+        .saved_agent_profiles
+        .iter()
+        .map(|profile| AgentPanelEntry {
+            ws_idx: app.active.unwrap_or_default(),
+            tab_idx: 0,
+            pane_id: crate::layout::PaneId::from_raw(0),
+            primary_label: profile.role.clone(),
+            primary_tab_label: None,
+            pane_label: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_label: None,
+            agent_kind_label: None,
+            agent: None,
+            state: AgentState::Idle,
+            seen: true,
+            last_agent_state_change_seq: None,
+            state_labels: [("idle".to_string(), "ready".to_string())]
+                .into_iter()
+                .collect(),
+            tokens: std::collections::HashMap::new(),
+            saved_profile_role: Some(profile.role.clone()),
+            profile_native_cwd: Some(profile.native_cwd.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    let live_entries = app
+        .workspaces
         .iter()
         .enumerate()
         .flat_map(|(ws_idx, ws)| {
@@ -177,10 +223,75 @@ fn collect_agent_panel_entries_with_runtimes(
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
                         state_labels: detail.state_labels,
                         tokens: detail.tokens,
+                        saved_profile_role: None,
+                        profile_native_cwd: None,
                     }
                 })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let mut entries = Vec::with_capacity(profile_entries.len() + live_entries.len());
+    for profile in profile_entries {
+        let role = profile.saved_profile_role.clone();
+        entries.push(profile);
+        entries.extend(
+            live_entries
+                .iter()
+                .filter(|entry| {
+                    role.as_deref()
+                        .is_some_and(|role| live_entry_matches_profile(entry, role))
+                })
+                .cloned(),
+        );
+    }
+    entries.extend(live_entries.into_iter().filter(|entry| {
+        !app.saved_agent_profiles
+            .iter()
+            .any(|profile| live_entry_matches_profile(entry, &profile.role))
+    }));
+    entries
+}
+
+fn live_entry_matches_profile(entry: &AgentPanelEntry, role: &str) -> bool {
+    let Some(label) = entry.agent_label.as_deref() else {
+        return false;
+    };
+    label == role
+        || label
+            .strip_prefix(role)
+            .is_some_and(|suffix| suffix.starts_with("-replica-"))
+}
+
+/// Return the sidebar entry occupying a screen row. Mouse handling uses this
+/// shared geometry so saved profile cards and live panes cannot drift apart.
+pub(crate) fn agent_panel_entry_at_row(app: &AppState, row: u16) -> Option<AgentPanelEntry> {
+    if app.sidebar_collapsed {
+        return None;
+    }
+    let (_, area) = expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+    let metrics = agent_panel_scroll_metrics(app, area);
+    let body = agent_panel_body_rect(area, should_show_scrollbar(metrics));
+    if body.height == 0 || row < body.y || row >= body.y + body.height {
+        return None;
+    }
+    let entries = agent_panel_entries(app);
+    let scroll = app.agent_panel_scroll.min(metrics.max_offset_from_bottom);
+    let mut row_y = body.y;
+    let body_bottom = body.y + body.height;
+    for (index, entry) in entries.iter().enumerate().skip(scroll) {
+        let height = agent_entry_height_in_body(app, entry, body.height);
+        if row_y.saturating_add(height) > body_bottom {
+            break;
+        }
+        if row >= row_y && row < row_y.saturating_add(height) {
+            return Some(entry.clone());
+        }
+        row_y = row_y
+            .saturating_add(height)
+            .saturating_add(agent_entry_gap(app, index, entries.len()))
+            .min(body_bottom);
+    }
+    None
 }
 
 pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static str {
@@ -532,17 +643,33 @@ pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Optio
 }
 
 pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
-    if area.width == 0 || area.height <= AGENT_PANEL_HEADER_ROWS {
+    if area.width == 0 || area.height <= AGENT_PANEL_HEADER_ROWS + 1 {
         return Rect::default();
     }
 
     let body_y = area.y.saturating_add(AGENT_PANEL_HEADER_ROWS);
-    let body_height = (area.y + area.height).saturating_sub(body_y);
+    let footer_y = area.y + area.height.saturating_sub(1);
+    let body_height = footer_y.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
 fn resolved_agent_rows(app: &AppState, entry: &AgentPanelEntry) -> Vec<Vec<ResolvedToken>> {
+    if let (Some(role), Some(native_cwd)) = (
+        entry.saved_profile_role.as_ref(),
+        entry.profile_native_cwd.as_ref(),
+    ) {
+        return vec![
+            vec![ResolvedToken::new(
+                ResolvedTokenKind::Workspace(role.clone()),
+                crate::config::SidebarTokenStyle::default(),
+            )],
+            vec![ResolvedToken::new(
+                ResolvedTokenKind::Custom(native_cwd.clone()),
+                crate::config::SidebarTokenStyle::default(),
+            )],
+        ];
+    }
     let label = entry
         .state_labels
         .get(agent_panel_status_key(entry.state, entry.seen))
@@ -1456,6 +1583,13 @@ fn render_agent_detail(
     );
     let control_label = active_agent_view_label(app)
         .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
+    let new_rect = agent_panel_new_button_rect(app, area);
+    if app.mouse_capture && new_rect != Rect::default() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("new", Style::default().fg(p.overlay0))),
+            new_rect,
+        );
+    }
     let toggle_rect = agent_panel_header_label_rect(area, control_label);
     if toggle_rect != Rect::default() {
         let color = if app.agent_view_override.is_some() {
@@ -1979,7 +2113,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
         assert_eq!(app.sidebar_agents.row_gap, 0);
 
-        let area = Rect::new(0, 0, 20, 5);
+        let area = Rect::new(0, 0, 20, 7);
         let metrics = agent_panel_scroll_metrics(&app, area);
         let body = agent_panel_body_rect(area, false);
         let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
@@ -2157,6 +2291,64 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             agent_entry_height_in_body(&app, &entry, agent_panel_body_rect(panel, false).height),
             agent_panel_body_rect(panel, false).height
         );
+    }
+
+    #[test]
+    fn saved_profiles_are_visible_before_live_panes_and_keep_spawn_targets() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.saved_agent_profiles = vec![crate::app::state::SavedAgentProfile {
+            role: "reviewer".into(),
+            native_cwd: "/tmp/reviewer".into(),
+            harness: "claude".into(),
+            replicas_assigned: 2,
+        }];
+        app.workspaces = vec![Workspace::test_new("repo")];
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Pi);
+
+        let entries = agent_panel_entries(&app);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].saved_profile_role.as_deref(), Some("reviewer"));
+        assert_eq!(entries[0].primary_label, "reviewer");
+        assert_eq!(
+            entries[0].profile_native_cwd.as_deref(),
+            Some("/tmp/reviewer")
+        );
+        assert_eq!(
+            resolved_agent_rows(&app, &entries[0])
+                .iter()
+                .flatten()
+                .map(|token| &token.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                &ResolvedTokenKind::Workspace("reviewer".into()),
+                &ResolvedTokenKind::Custom("/tmp/reviewer".into()),
+            ]
+        );
+        assert_eq!(entries[1].saved_profile_role, None);
+    }
+
+    #[test]
+    fn agent_panel_header_visibly_offers_new_profile_creation() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mouse_capture = true;
+        let area = Rect::new(0, 0, 26, 8);
+        let new_button = agent_panel_new_button_rect(&app, area);
+        assert_ne!(new_button, Rect::default());
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_agent_detail(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+
+        let footer = row_text(terminal.backend().buffer(), new_button.y, area.width);
+        assert_eq!(footer, "new");
+        let header = row_text(terminal.backend().buffer(), area.y + 1, area.width);
+        assert!(header.contains("grouped"), "header: {header:?}");
     }
 
     #[test]

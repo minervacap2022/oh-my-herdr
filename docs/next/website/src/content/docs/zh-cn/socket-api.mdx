@@ -36,7 +36,7 @@ socket API 可以:
 - 创建、列出、聚焦、重命名和关闭工作区
 - 创建、列出、聚焦、重命名和关闭标签页
 - 列出、检查、分割、交换、聚焦、调整、重命名、读取、关闭窗格并向其发送输入
-- 通过 CLI 辅助命令列出、检查、读取、提示、等待、重命名、聚焦、启动和附加智能体
+- 通过 CLI 辅助命令列出、检查、读取、提示、等待、重命名、聚焦、启动、spawn 和附加智能体
 - 从钩子和插件上报自定义智能体状态
 - 订阅事件并等待输出或状态变化
 - 安装和卸载内置集成
@@ -102,12 +102,19 @@ herdr pane read w1:p2 --source recent --lines 50
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.spawn`、`agent.profile.get`、`agent.profile.list`、`agent.profile.set`、`agent.profile.set_md` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
+
+`agent.spawn` 会创建或复用 `role` 指定的持久化 profile，在选定的标签页中启动并返回 `.result.spawned`（省略 `tab_id` 时使用活动标签页）。通过 `tab_id` 选定后台标签页不会改变焦点。它会复用可用 shell；没有可用 shell 时自动分割最后一个窗格，并把后续仍存活的实例命名为 `role-replica-N`。`cwd_mode` 默认为 `tab`，设为 `agent` 时使用 profile 的 native 目录。`agent.profile.create` 可创建 codex、pi 或 claude profile，并同时创建当前会话专属的 `AGENTS.md`；Codex 使用 `model_instructions_file`，Pi/Claude 使用原生 prompt-file 参数。`agent.profile.get`、`agent.profile.list`、`agent.profile.set` 和 `agent.profile.set_md` 用于读取和更新 profile。spawn 会为 Claude、Codex、Pi 应用 model 和 effort，并为 Claude、Pi 应用 allowlist。`apikey_ref` 对 Claude 和 Codex 使用 `env:NAME` 环境变量引用。不支持的设置会明确失败，而不是静默忽略。
+
+```json
+{"id":"spawn-reviewer","method":"agent.spawn","params":{"role":"reviewer","kind":"claude","cwd_mode":"tab","timeout_ms":30000}}
+{"id":"profile-context","method":"agent.profile.set_md","params":{"role":"reviewer","name":"context.md","path":"/workspace/context.md"}}
+```
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 
@@ -634,6 +641,8 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 ```
 
 第一个响应确认订阅。之后的行是推送的事件。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
+
+订阅客户端必须持续读取套接字。Herdr 会限制每条连接的可靠控制队列；该队列满时，Herdr 会退役客户端连接。连接被退役后，请重新连接并再次订阅。
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。

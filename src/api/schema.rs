@@ -123,8 +123,26 @@ pub enum Method {
     AgentFocus(AgentTarget),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
+    #[serde(rename = "agent.spawn")]
+    AgentSpawn(AgentSpawnParams),
+    #[serde(rename = "agent.revive")]
+    AgentRevive(AgentReviveParams),
+    #[serde(rename = "agent.roster.list")]
+    AgentRosterList(EmptyParams),
+    #[serde(rename = "agent.profile.create")]
+    AgentProfileCreate(AgentProfileCreateParams),
+    #[serde(rename = "agent.profile.set_md")]
+    AgentProfileSetMd(AgentProfileSetMdParams),
+    #[serde(rename = "agent.profile.get")]
+    AgentProfileGet(AgentProfileGetParams),
+    #[serde(rename = "agent.profile.list")]
+    AgentProfileList(EmptyParams),
+    #[serde(rename = "agent.profile.set")]
+    AgentProfileSet(AgentProfileSetParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    #[serde(rename = "agent.broadcast")]
+    AgentBroadcast(AgentBroadcastParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]

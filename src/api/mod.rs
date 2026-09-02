@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::api::schema::{Method, Request};
 
 pub const SOCKET_PATH_ENV_VAR: &str = "HERDR_SOCKET_PATH";
+pub(crate) const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn request_changes_ui(request: &Request) -> bool {
     matches!(
@@ -47,7 +48,13 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentViewClear(_)
             | Method::AgentFocus(_)
             | Method::AgentStart(_)
+            | Method::AgentSpawn(_)
+            | Method::AgentRevive(_)
+            | Method::AgentProfileCreate(_)
+            | Method::AgentProfileSetMd(_)
+            | Method::AgentProfileSet(_)
             | Method::AgentPrompt(_)
+            | Method::AgentBroadcast(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)

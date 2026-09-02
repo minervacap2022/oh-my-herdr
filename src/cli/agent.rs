@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentProfileCreateParams, AgentProfileGetParams, AgentPromptParams, AgentPromptWaitOptions,
+    AgentReadParams, AgentRenameParams, AgentReviveParams, AgentSendKeysParams, AgentSpawnParams,
+    AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody, ErrorResponse, Method,
+    PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -21,11 +22,18 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
+        "broadcast" => agent_broadcast(&args[1..]),
+        "roster" => agent_roster(&args[1..]),
+        "create" => agent_create(&args[1..]),
+        "profile" => agent_profile(&args[1..]),
+        "profiles" => agent_profiles(&args[1..]),
+        "revive" => agent_revive(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "spawn" => agent_spawn(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -36,6 +44,93 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn agent_create(args: &[String]) -> std::io::Result<i32> {
+    let Some(role) = args.first() else {
+        eprintln!(
+            "usage: herdr agent create <ROLE> --harness <codex|pi|claude> --cwd <DIR> [--instructions-file <PATH>]"
+        );
+        return Ok(2);
+    };
+    let mut harness = None;
+    let mut native_cwd = None;
+    let mut instructions_file = None;
+    let mut index = 1;
+    while index < args.len() {
+        let option = &args[index];
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {option}");
+            return Ok(2);
+        };
+        match option.as_str() {
+            "--harness" => harness = Some(value.clone()),
+            "--cwd" => native_cwd = Some(value.clone()),
+            "--instructions-file" => instructions_file = Some(value.clone()),
+            _ => {
+                eprintln!("unknown option: {option}");
+                return Ok(2);
+            }
+        }
+        index += 2;
+    }
+    let Some(harness) = harness else {
+        eprintln!("--harness is required");
+        return Ok(2);
+    };
+    if !matches!(harness.as_str(), "codex" | "pi" | "claude") {
+        eprintln!("invalid --harness: {harness} (expected codex, pi, or claude)");
+        return Ok(2);
+    }
+    let Some(native_cwd) = native_cwd else {
+        eprintln!("--cwd is required");
+        return Ok(2);
+    };
+    let instructions = match instructions_file {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(err) => {
+                eprintln!("failed to read --instructions-file {path}: {err}");
+                return Ok(2);
+            }
+        },
+        None => None,
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:create".into(),
+        method: Method::AgentProfileCreate(AgentProfileCreateParams {
+            role: role.clone(),
+            harness,
+            native_cwd,
+            instructions,
+        }),
+    })?)
+}
+
+fn agent_profile(args: &[String]) -> std::io::Result<i32> {
+    let Some(role) = args.first() else {
+        eprintln!("usage: herdr agent profile <ROLE>");
+        return Ok(2);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: herdr agent profile <ROLE>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:profile".into(),
+        method: Method::AgentProfileGet(AgentProfileGetParams { role: role.clone() }),
+    })?)
+}
+
+fn agent_profiles(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr agent profiles");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:profiles".into(),
+        method: Method::AgentProfileList(EmptyParams::default()),
+    })?)
 }
 
 fn agent_explain(args: &[String]) -> std::io::Result<i32> {
@@ -433,6 +528,101 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
         }
     }
+}
+
+fn agent_spawn(args: &[String]) -> std::io::Result<i32> {
+    let Some(role) = args.first() else {
+        eprintln!(
+            "usage: herdr agent spawn <ROLE> [--kind <KIND>] [--tab TAB] [--cwd <tab|agent>] \
+             [--timeout MS] [-- <agent-args...>]"
+        );
+        return Ok(2);
+    };
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut kind = None;
+    let mut tab_id = None;
+    let mut cwd_mode = None;
+    let mut timeout_ms = None;
+    let mut index = 1;
+    while index < separator {
+        match args[index].as_str() {
+            "--kind" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --kind");
+                    return Ok(2);
+                };
+                kind = Some(value.clone());
+                index += 2;
+            }
+            "--cwd" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --cwd");
+                    return Ok(2);
+                };
+                cwd_mode = Some(value.clone());
+                index += 2;
+            }
+            "--tab" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --tab");
+                    return Ok(2);
+                };
+                tab_id = Some(super::normalize_tab_id(value));
+                index += 2;
+            }
+            "--timeout" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --timeout");
+                    return Ok(2);
+                };
+                timeout_ms = match parse_timeout(value) {
+                    Ok(timeout_ms) => Some(timeout_ms),
+                    Err(exit_code) => return Ok(exit_code),
+                };
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    if let Some(kind) = kind.as_deref() {
+        if crate::detect::parse_agent_label(kind).is_none() {
+            eprintln!("unsupported interactive agent kind: {kind}");
+            return Ok(2);
+        }
+    }
+    let cwd_mode = match cwd_mode.as_deref() {
+        None | Some("tab") => "tab".to_string(),
+        Some("agent") => "agent".to_string(),
+        Some(other) => {
+            eprintln!("invalid --cwd: {other} (expected \"tab\" or \"agent\")");
+            return Ok(2);
+        }
+    };
+    let agent_args = if separator < args.len() {
+        args[separator + 1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    // The server performs the spawn (profile lookup, tab/pane selection, and
+    // auto-split) synchronously and returns the started agent, so the CLI just
+    // forwards the request and prints the result.
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:spawn".into(),
+        method: Method::AgentSpawn(AgentSpawnParams {
+            role: role.clone(),
+            kind,
+            tab_id,
+            cwd_mode,
+            timeout_ms,
+            args: agent_args,
+        }),
+    })?)
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -840,6 +1030,101 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&response)
 }
 
+fn agent_broadcast(args: &[String]) -> std::io::Result<i32> {
+    let Some(role) = args.first() else {
+        eprintln!("usage: herdr agent broadcast <role> <text>");
+        return Ok(2);
+    };
+    let Some(text) = args.get(1) else {
+        eprintln!("agent broadcast requires text");
+        return Ok(2);
+    };
+    if args.len() != 2 {
+        eprintln!("usage: herdr agent broadcast <role> <text>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:broadcast".into(),
+        method: Method::AgentBroadcast(crate::api::schema::AgentBroadcastParams {
+            role: role.clone(),
+            text: text.clone(),
+        }),
+    })?)
+}
+
+fn agent_roster(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr agent roster");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:roster".into(),
+        method: Method::AgentRosterList(EmptyParams::default()),
+    })?)
+}
+
+fn agent_revive(args: &[String]) -> std::io::Result<i32> {
+    let Some(instance_id) = args.first() else {
+        eprintln!(
+            "usage: herdr agent revive <instance-id> [--tab TAB] [--cwd tab|agent] [--timeout MS]"
+        );
+        return Ok(2);
+    };
+    let mut tab_id = None;
+    let mut cwd_mode = "tab".to_string();
+    let mut timeout_ms = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--tab" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --tab");
+                    return Ok(2);
+                };
+                tab_id = Some(super::normalize_tab_id(value));
+                index += 2;
+            }
+            "--cwd" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --cwd");
+                    return Ok(2);
+                };
+                if !matches!(value.as_str(), "tab" | "agent") {
+                    eprintln!("invalid --cwd: {value} (expected \"tab\" or \"agent\")");
+                    return Ok(2);
+                }
+                cwd_mode = value.clone();
+                index += 2;
+            }
+            "--timeout" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --timeout");
+                    return Ok(2);
+                };
+                timeout_ms = match parse_timeout(value) {
+                    Ok(timeout_ms) => Some(timeout_ms),
+                    Err(exit_code) => return Ok(exit_code),
+                };
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:revive".into(),
+        method: Method::AgentRevive(AgentReviveParams {
+            instance_id: instance_id.clone(),
+            tab_id,
+            cwd_mode,
+            timeout_ms,
+            args: Vec::new(),
+        }),
+    })?)
+}
+
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
         eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
@@ -926,6 +1211,12 @@ fn print_agent_help() {
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent broadcast <role> <text>");
+    eprintln!("  herdr agent roster");
+    eprintln!("  herdr agent create <role> --harness codex|pi|claude --cwd DIR [--instructions-file PATH]");
+    eprintln!("  herdr agent profile <role>");
+    eprintln!("  herdr agent profiles");
+    eprintln!("  herdr agent revive <instance-id> [--tab TAB] [--cwd tab|agent] [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -933,11 +1224,15 @@ fn print_agent_help() {
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );
+    eprintln!(
+        "  herdr agent spawn <role> [--kind KIND] [--tab TAB] [--cwd tab|agent] [--timeout MS] \
+         [-- <agent-args...>]"
+    );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
     );
-    eprintln!("  targets accept unique agent names and pane ids that currently host agents");
+    eprintln!("  targets accept unique names, current pane ids, and role@pane for replicas");
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));
 }
 

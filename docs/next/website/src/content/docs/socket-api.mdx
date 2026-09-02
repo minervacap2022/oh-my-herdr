@@ -40,7 +40,7 @@ The socket API can:
 - create, list, focus, rename, and close workspaces
 - create, list, focus, rename, and close tabs
 - list, inspect, split, swap, focus, resize, rename, read, close, and send input to panes
-- list, inspect, read, prompt, wait on, rename, focus, start, and attach agents through CLI helpers
+- list, inspect, read, prompt, wait on, rename, focus, start, spawn, and attach agents through CLI helpers
 - report custom agent state from hooks and plugins
 - subscribe to events and wait for output or state changes
 - install and uninstall built-in integrations
@@ -106,12 +106,32 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.broadcast`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.spawn`, `agent.revive`, `agent.roster.list`, `agent.profile.get`, `agent.profile.list`, `agent.profile.set`, `agent.profile.set_md`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+
+Agent targets accept a persistent role plus an exact pane disambiguator in the
+form `role@w:t:p`. `agent.broadcast` takes `{role, text}` and submits to every
+live instance of that role after validating all destinations.
+
+`agent.roster.list` returns the persistent directory, including terminated
+instances. `agent.revive` takes `{instance_id, tab_id?, cwd_mode?, timeout_ms?,
+args?}` and restores the exact archived instance identity.
+
+`agent.spawn` creates or reuses the persistent profile named by `role`, launches in the selected tab (or the active tab when `tab_id` is omitted), and returns `.result.spawned`. Profiles, roster records, and replica counters are scoped to the current Herdr session. Selecting a background tab with `tab_id` does not change focus. It reuses an available shell or auto-splits the last pane, and names later live instances `role-replica-N`. An available shell is used immediately. For a fresh root shell that is still starting, the request waits up to two seconds before reusing that root pane; if it does not become ready, Herdr preserves the root pane and returns `agent_spawn_failed`. When auto-splitting is required, the request waits for the new shell to reach its prompt before submitting the agent command, polling for up to two seconds; if it does not become ready, Herdr rolls back the new pane and returns `agent_spawn_failed`. `cwd_mode` is `tab` by default or `agent` for the profile's native directory. After command submission, `timeout_ms` is a managed detection deadline (3001–300000 milliseconds); the response can still report `launch_pending`, so use `agent.wait` when readiness is required.
+
+`agent.profile.create` creates a `codex`, `pi`, or `claude` profile with an explicit `native_cwd` and a session-owned `AGENTS.md` file. Its optional `instructions` string initializes that file, whose path is returned in `profile.mds`. Codex receives the file through `model_instructions_file`; Pi and Claude receive their native prompt-file flags. `agent.profile.get` reads one profile without creating it; `agent.profile.list` returns current-session profiles; `agent.profile.set` atomically patches `harness`, `native_cwd`, model, effort, API-key reference, and an allowlist object of the form `{"tools":["Read", ...]}`; and `agent.profile.set_md` manages additional named Markdown files. Omitted fields stay unchanged, explicit clear flags remove optional values, and a clear flag cannot be combined with a value for that field. Generic spawn applies model and effort for Claude, Codex, and Pi, applies the allowlist for Claude or Pi, and maps `apikey_ref: "env:NAME"` for Claude or Codex without putting the secret in the command text. Unsupported settings fail explicitly. `native_cwd` must be an existing UTF-8 directory; profile Markdown paths must resolve to existing regular UTF-8 files. All role-taking profile methods return `invalid_profile_role` for malformed roles. If either profile mutation cannot persist its registry update, it returns `agent_profile_persist_failed` and keeps the previous in-memory profile state.
+
+```json
+{"id":"spawn-reviewer","method":"agent.spawn","params":{"role":"reviewer","kind":"claude","cwd_mode":"tab","timeout_ms":30000}}
+{"id":"profile-get","method":"agent.profile.get","params":{"role":"reviewer"}}
+{"id":"profile-list","method":"agent.profile.list","params":{}}
+{"id":"profile-set","method":"agent.profile.set","params":{"role":"reviewer","harness":"claude","native_cwd":"/workspace"}}
+{"id":"profile-context","method":"agent.profile.set_md","params":{"role":"reviewer","name":"context.md","path":"/workspace/context.md"}}
+```
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
@@ -811,6 +831,10 @@ Subscribe to events when you need a long-lived stream:
 The first response acknowledges the subscription. Later lines are pushed events.
 Lifecycle subscriptions start when the request is accepted and do not replay
 events retained before that point.
+
+Subscribers must continuously read from the socket. Herdr bounds each
+connection's reliable control queue; when that queue fills, Herdr retires the
+client connection. Reconnect and subscribe again after a retired connection.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.metadata_updated`, `workspace.renamed`, `workspace.moved`, `workspace.reordered`, `workspace.closed`, and `workspace.focused`. `workspace.metadata_updated` reports token changes and TTL expiry without invoking plugin event hooks. Other workspace events describe Herdr UI/runtime lifecycle. `workspace.created` includes optional `workspace.worktree` provenance when the workspace belongs to a worktree group. `workspace.moved` includes the moved `workspace_id`, requested `insert_index`, and updated ordered `workspaces` list. `workspace.reordered` includes the atomically moved `workspace_ids`, optional `before_workspace_id`, and authoritative ordered `workspaces` list. `workspace.closed` includes a final `workspace` snapshot when Herdr can still identify it before removal.
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,

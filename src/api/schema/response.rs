@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::agents::AgentInfo;
+use super::agents::{AgentInfo, AgentProfileInfo, AgentRosterEntryInfo, SpawnedAgentInfo};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
 use super::integrations::{
@@ -101,8 +101,29 @@ pub enum ResponseResult {
         agent: AgentInfo,
         argv: Vec<String>,
     },
+    AgentSpawned {
+        spawned: SpawnedAgentInfo,
+    },
+    AgentRevived {
+        revived: SpawnedAgentInfo,
+    },
+    AgentRosterList {
+        entries: Vec<AgentRosterEntryInfo>,
+    },
+    AgentProfileInfoSet {
+        profile: AgentProfileInfo,
+    },
+    AgentProfileInfo {
+        profile: AgentProfileInfo,
+    },
+    AgentProfileList {
+        profiles: Vec<AgentProfileInfo>,
+    },
     AgentPrompted {
         agent: AgentInfo,
+    },
+    AgentBroadcast {
+        agents: Vec<AgentInfo>,
     },
     AgentList {
         agents: Vec<AgentInfo>,

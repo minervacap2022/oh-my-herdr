@@ -56,6 +56,25 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+### 永続プロファイルの spawn
+
+ロールのプロファイルとレプリカ番号をセッションをまたいで維持したい場合は `agent spawn` を使います。ロールの保存済みプロファイルを作成または再利用し、最初のインスタンスにはロール名を、後続の live インスタンスには `reviewer-replica-1` のような名前を付けます。選択したタブ（既定ではアクティブなタブ）では最初に利用可能なシェルを再利用し、利用可能なシェルがないときは最後のペインを自動分割します。
+
+`--kind` はこの起動だけ保存済みプロファイルの harness を上書きします。省略時は保存済み harness（既定は `codex`）を使います。フォーカスを変えずにバックグラウンドのタブを対象にするには `--tab <tab_id>` を使います。既定の `--cwd tab` は対象タブの作業ディレクトリから起動します。`--cwd agent` はプロファイル固有の native ディレクトリを使い、その値は最初の spawn 時にタブから設定されます。利用可能なシェルはすぐに使われます。自動分割が必要な場合は、新しいシェルがプロンプトに戻ってからエージェントコマンドを送信するまで最大 2 秒ポーリングします。シェルが準備できなければ新しいペインをロールバックし、`agent_spawn_failed` を返します。コマンド送信後は、検出が落ち着くまでレスポンスが `launch_pending` を返すことがあります。`--timeout` は 3001–300000 ミリ秒の管理された検出期限であり、レスポンスが ready まで待つことを保証しません。準備完了が必要な自動化では、その後に `agent wait <name> --until idle` を使ってください。
+
+```bash
+herdr agent spawn reviewer --kind claude --tab w1:t2 --cwd tab -- --model sonnet
+herdr agent wait reviewer --until idle
+```
+
+`agent create <role> --harness codex|pi|claude --cwd <dir> [--instructions-file <path>]` でネイティブな永続プロファイルを作成します。現在のセッション専用 `agent-context/<role>/AGENTS.md` が作成され、正確なパスが返ります。このファイルを編集するとエージェントの永続指示を変更できます。Codex は `model_instructions_file`、Pi は `--append-system-prompt`、Claude は `--append-system-prompt-file` で注入します。`agent profile` は 1 件を表示し、`agent profiles` は全プロファイルを一覧します。socket の `agent.profile.create`、`agent.profile.get`、`agent.profile.list`、`agent.profile.set`、`agent.profile.set_md` も利用できます。
+
+### Herdr 内でネイティブプロファイルを作成・起動する
+
+Agents サイドバーのセクション左下には Spaces と同じ見た目の **new** コントロールがあります。これを押すと同じネイティブプロファイルフォームが開き、既定は Codex です。harness フィールドで Pi または Claude に変更できます。保存済みプロファイルには名前と native working directory が表示され、その下にライブの agent pane が表示されます。アクティブな Space で保存済みプロファイルをクリックすると、**Use space cwd** または **Use agent native cwd** を選択できます。どちらを選んでもプロファイル固有の `AGENTS.md` は維持されます。Space の作成時には native working directory を入力し、空欄なら `~` を使います。Herdr で **Settings → Agents** を開くこともできます（既定のショートカットは `ctrl+b`、続けて `s`）。role、native working directory、最初の `AGENTS.md` 指示を入力して保存します。`e` で native harness または working directory を変更できます。
+
+保存済み設定は `agent.profile.get` と `agent.profile.list` で読み取れます。`agent.profile.set` は harness、native cwd、model、effort、API-key reference、allowlist を原子的に更新し、任意値は `clear_model`、`clear_effort`、`clear_apikey_ref`、`clear_allowlist` で消去します。generic spawn は Claude、Codex、Pi に model と effort を適用し、Claude と Pi に `{"tools":[...]}` allowlist を適用します。API-key reference は `env:NAME` の環境変数参照で、Claude と Codex で利用できます。対応しない設定は黙って無視せず失敗します。明示した `native_cwd` は存在する UTF-8 ディレクトリでなければなりません。profile Markdown は引き続き `agent.profile.set_md` で管理します。
+
 ## 操作面を選ぶ
 
 | 目的 | コマンド |
@@ -65,6 +84,7 @@ herdr agent rename w1:p2 reviewer
 | ターミナルキーや修飾キーの組み合わせを送る | `pane send-keys` |
 | 文字列や正規表現を待つ | `pane wait-output` |
 | 既存のペインで対応済みエージェントを起動する | `agent start` |
+| 永続ロールプロファイルを開始する | `agent spawn` |
 | プロンプトを送信し、必要なら完了を待つ | `agent prompt` |
 | エージェントの対話 UI にキーを送る | `agent send-keys` |
 | エージェントのライフサイクル状態を待つ | `agent wait` |

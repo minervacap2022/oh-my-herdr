@@ -781,31 +781,21 @@ fn requested_keybindings() -> ClientKeybindings {
     }
 }
 
-#[cfg(windows)]
-fn set_handshake_recv_timeout(
-    stream: &LocalStream,
-    timeout: Option<Duration>,
-    context: &'static str,
-) -> Result<(), ClientError> {
-    match stream.set_recv_timeout(timeout) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-            debug!(err = %err, context, "client socket receive timeout unavailable");
-            Ok(())
-        }
-        Err(err) => Err(ClientError::ConnectionFailed(err)),
-    }
-}
-
-#[cfg(not(windows))]
-fn set_handshake_recv_timeout(
-    stream: &LocalStream,
-    timeout: Option<Duration>,
-    _context: &'static str,
-) -> Result<(), ClientError> {
-    stream
-        .set_recv_timeout(timeout)
-        .map_err(ClientError::ConnectionFailed)
+fn read_handshake_welcome(
+    stream: &mut LocalStream,
+    timeout: Duration,
+) -> Result<ServerMessage, protocol::FramingError> {
+    let mut reader = crate::ipc::DeadlineLocalStreamReader::new(
+        stream,
+        std::time::Instant::now() + timeout,
+        "timed out waiting for server Welcome",
+    )
+    .map_err(protocol::FramingError::Io)?;
+    let result = protocol::read_message(&mut reader, MAX_FRAME_SIZE);
+    reader
+        .restore_stream_mode()
+        .map_err(protocol::FramingError::Io)?;
+    result
 }
 
 fn client_launch_mode(
@@ -865,17 +855,7 @@ fn do_handshake(
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
 
     // Read Welcome.
-    set_handshake_recv_timeout(
-        stream,
-        Some(handshake_read_timeout()),
-        "client handshake read timeout unavailable",
-    )?;
-    let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
-    set_handshake_recv_timeout(
-        stream,
-        None,
-        "failed to clear client handshake read timeout",
-    )?;
+    let welcome: ServerMessage = read_handshake_welcome(stream, handshake_read_timeout())?;
 
     match welcome {
         ServerMessage::Welcome {
@@ -2649,6 +2629,8 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use interprocess::local_socket::traits::Listener as _;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
@@ -2764,6 +2746,101 @@ mod tests {
         let _remote = EnvVarGuard::set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
 
         assert_eq!(handshake_read_timeout(), REMOTE_HANDSHAKE_READ_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_trickled_welcome_read_observes_total_deadline() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write as _;
+
+        let path = std::path::PathBuf::from("/tmp").join(format!(
+            "h{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        let mut frame = Vec::new();
+        protocol::write_message(
+            &mut frame,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: RenderEncoding::SemanticFrame,
+                error: None,
+            },
+        )
+        .expect("encode welcome");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            server
+                .write_all(&frame[..1])
+                .expect("write first welcome byte");
+            server.flush().expect("flush first welcome byte");
+            started_tx.send(()).expect("signal first welcome byte");
+            for byte in &frame[1..] {
+                std::thread::sleep(Duration::from_millis(15));
+                if server.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                if server.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        let timeout = Duration::from_millis(50);
+        let deadline = timeout + Duration::from_millis(250);
+
+        started_rx.recv().expect("first welcome byte arrives");
+        let started = std::time::Instant::now();
+        let error = read_handshake_welcome(&mut client, timeout).unwrap_err();
+
+        assert!(matches!(
+            error,
+            protocol::FramingError::Io(ref err) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            started.elapsed() <= deadline,
+            "trickled Welcome exceeded the {deadline:?} total deadline"
+        );
+        writer.join().expect("trickle writer join");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_silent_welcome_read_times_out() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-client-welcome-timeout-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+        let _server = listener.accept().unwrap();
+        let timeout = Duration::from_millis(25);
+        let deadline = timeout + Duration::from_millis(250);
+        let start = std::time::Instant::now();
+
+        let err = read_handshake_welcome(&mut client, timeout).unwrap_err();
+
+        assert!(matches!(
+            err,
+            protocol::FramingError::Io(ref err) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            start.elapsed() <= deadline,
+            "silent Welcome read exceeded {deadline:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

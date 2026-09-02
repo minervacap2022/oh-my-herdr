@@ -25,7 +25,7 @@ pub(super) enum ResolvedTokenKind {
 }
 
 impl ResolvedToken {
-    fn new(kind: ResolvedTokenKind, style: SidebarTokenStyle) -> Self {
+    pub(super) fn new(kind: ResolvedTokenKind, style: SidebarTokenStyle) -> Self {
         Self { kind, style }
     }
 
@@ -175,6 +175,8 @@ mod tests {
             last_agent_state_change_seq: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
+            saved_profile_role: None,
+            profile_native_cwd: None,
         }
     }
 

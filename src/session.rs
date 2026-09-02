@@ -167,7 +167,7 @@ pub fn data_dir_for(name: Option<&str>) -> PathBuf {
 }
 
 pub fn api_socket_path_for(name: Option<&str>) -> PathBuf {
-    data_dir_for(name).join("herdr.sock")
+    data_dir_for(name).join(format!("{}.sock", crate::config::product_name()))
 }
 
 pub fn active_api_socket_path() -> PathBuf {
@@ -181,7 +181,7 @@ pub fn active_api_socket_path() -> PathBuf {
 }
 
 pub fn client_socket_path_for(name: Option<&str>) -> PathBuf {
-    data_dir_for(name).join("herdr-client.sock")
+    data_dir_for(name).join(format!("{}-client.sock", crate::config::product_name()))
 }
 
 pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
@@ -350,22 +350,42 @@ fn send_stop_request_inner(
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    let Some(read_timeout) = socket_timeout_until(deadline) else {
-        return Ok(None);
-    };
-    if let Err(err) = stream.set_recv_timeout(Some(read_timeout)) {
-        if stop_timeout_error_allows_wait(&err) {
+    #[cfg(unix)]
+    {
+        let mut reader = crate::ipc::DeadlineLocalStreamReader::new(
+            stream,
+            deadline,
+            "timed out waiting for server stop acknowledgement",
+        )?;
+        let mut line = String::new();
+        let read_result = BufReader::new(&mut reader).read_line(&mut line);
+        reader.restore_stream_mode()?;
+        let bytes_read = read_result?;
+        if bytes_read == 0 {
             return Ok(None);
         }
-        return Err(err);
+        Ok(Some(line))
     }
 
-    let mut line = String::new();
-    let bytes_read = BufReader::new(stream).read_line(&mut line)?;
-    if bytes_read == 0 {
-        return Ok(None);
+    #[cfg(not(unix))]
+    {
+        let Some(read_timeout) = socket_timeout_until(deadline) else {
+            return Ok(None);
+        };
+        if let Err(err) = stream.set_recv_timeout(Some(read_timeout)) {
+            if stop_timeout_error_allows_wait(&err) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+
+        let mut line = String::new();
+        let bytes_read = BufReader::new(stream).read_line(&mut line)?;
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+        Ok(Some(line))
     }
-    Ok(Some(line))
 }
 
 fn stop_timeout_error_allows_wait(err: &std::io::Error) -> bool {
@@ -564,6 +584,49 @@ mod tests {
             )
             .unwrap(),
             None
+        );
+        assert!(handle.join().unwrap().contains("server.stop"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_request_rejects_response_that_trickles_past_deadline() {
+        use interprocess::TryClone as _;
+        use std::io::Write as _;
+
+        let (client, mut server, _path) = local_stream_pair("stop-trickled-response");
+        let handle = std::thread::spawn(move || {
+            let reader = server.try_clone().expect("clone server stream");
+            let mut request = String::new();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .expect("read stop request");
+            for byte in b"{\"id\":\"cli:session:stop\",\"result\":{\"type\":\"ok\"}}\n" {
+                std::thread::sleep(Duration::from_millis(15));
+                if server.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                if server.flush().is_err() {
+                    break;
+                }
+            }
+            request
+        });
+        let request = serde_json::json!({
+            "id": "cli:session:stop",
+            "method": "server.stop",
+            "params": {}
+        });
+        let timeout = Duration::from_millis(50);
+        let deadline = timeout + Duration::from_millis(250);
+        let started = Instant::now();
+
+        let response = send_stop_request(client, &request, started + timeout).unwrap();
+
+        assert_eq!(response, None);
+        assert!(
+            started.elapsed() <= deadline,
+            "trickled stop response exceeded the {deadline:?} total deadline"
         );
         assert!(handle.join().unwrap().contains("server.stop"));
     }

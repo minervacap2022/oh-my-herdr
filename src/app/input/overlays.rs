@@ -396,7 +396,14 @@ impl AppState {
     }
 
     pub(super) fn rename_modal_inner(&self) -> Option<Rect> {
-        self.onboarding_modal_inner(56, 7)
+        self.onboarding_modal_inner(
+            56,
+            if self.pending_workspace_create_cwd.is_some() {
+                10
+            } else {
+                7
+            },
+        )
     }
 
     fn release_notes_body_rect(&self) -> Option<Rect> {

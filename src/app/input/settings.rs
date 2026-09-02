@@ -2,8 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::layout::Rect;
 
 use crate::{
+    api::schema::{AgentProfileCreateParams, AgentProfileSetParams},
     app::{
-        state::{AppState, SettingsSection, THEME_NAMES},
+        state::{AgentProfileForm, AppState, SettingsSection, THEME_NAMES},
         App, Mode,
     },
     config::{StatusIndicatorStyle, ToastDelivery},
@@ -19,6 +20,10 @@ pub(super) enum SettingsAction {
     SaveToastDelivery(ToastDelivery),
     SaveAgentBorderLabels(bool),
     InstallRecommendedIntegrations,
+    OpenAgentCreate(String),
+    OpenAgentEdit(String),
+    SaveAgentProfile,
+    StartAgentProfile(String),
 }
 
 impl App {
@@ -36,6 +41,12 @@ impl App {
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
                 }
+                SettingsAction::OpenAgentCreate(harness) => {
+                    self.open_agent_profile_create_form(harness)
+                }
+                SettingsAction::OpenAgentEdit(role) => self.open_agent_profile_edit_form(role),
+                SettingsAction::SaveAgentProfile => self.save_agent_profile_form(),
+                SettingsAction::StartAgentProfile(role) => self.spawn_agent_profile_via_api(role),
             }
         }
         if previous_section != SettingsSection::Integrations
@@ -43,6 +54,118 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
+    }
+
+    pub(super) fn open_agent_profile_create_form(&mut self, harness: String) {
+        let native_cwd = self
+            .state
+            .active
+            .and_then(|ws_idx| self.focused_pane_cwd_in_workspace(ws_idx))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+            .display()
+            .to_string();
+        self.state.settings.agent_profile_form = Some(AgentProfileForm {
+            existing_role: None,
+            role: String::new(),
+            harness,
+            native_cwd,
+            instructions: "# Agent instructions".to_string(),
+            selected_field: 0,
+        });
+    }
+
+    pub(super) fn open_sidebar_agent_profile_create_form(&mut self) {
+        open_settings_at(&mut self.state, SettingsSection::Agents);
+        self.open_agent_profile_create_form("codex".to_string());
+    }
+
+    pub(super) fn open_agent_profile_edit_form(&mut self, role: String) {
+        match self.profile(&role) {
+            Ok(profile) => {
+                self.state.settings.agent_profile_form = Some(AgentProfileForm {
+                    existing_role: Some(profile.role.clone()),
+                    role: profile.role,
+                    harness: profile.harness,
+                    native_cwd: profile.native_cwd,
+                    instructions: String::new(),
+                    selected_field: 0,
+                });
+            }
+            Err(err) => self.show_agent_profile_feedback(
+                crate::app::state::ToastKind::NeedsAttention,
+                "agent profile failed",
+                self.agent_profile_error_body(err).message,
+            ),
+        }
+    }
+
+    pub(super) fn save_agent_profile_form(&mut self) {
+        let Some(form) = self.state.settings.agent_profile_form.take() else {
+            return;
+        };
+        let result = match form.existing_role.clone() {
+            Some(role) => self.set_profile(AgentProfileSetParams {
+                role,
+                harness: Some(form.harness.clone()),
+                native_cwd: Some(form.native_cwd.clone()),
+                model: None,
+                effort: None,
+                apikey_ref: None,
+                allowlist: None,
+                clear_model: false,
+                clear_effort: false,
+                clear_apikey_ref: false,
+                clear_allowlist: false,
+            }),
+            None => self.create_profile(AgentProfileCreateParams {
+                role: form.role.clone(),
+                harness: form.harness.clone(),
+                native_cwd: form.native_cwd.clone(),
+                instructions: Some(form.instructions.clone()),
+            }),
+        };
+
+        match result {
+            Ok(profile) => {
+                self.state.settings.list.selected = self
+                    .state
+                    .saved_agent_profiles
+                    .iter()
+                    .position(|saved| saved.role == profile.role)
+                    .map(|idx| idx + 3)
+                    .unwrap_or(0);
+                self.show_agent_profile_feedback(
+                    crate::app::state::ToastKind::UpdateInstalled,
+                    "agent profile saved",
+                    format!("{} uses {}", profile.role, profile.harness),
+                );
+            }
+            Err(err) => {
+                self.state.settings.agent_profile_form = Some(form);
+                self.show_agent_profile_feedback(
+                    crate::app::state::ToastKind::NeedsAttention,
+                    "agent profile failed",
+                    self.agent_profile_error_body(err).message,
+                );
+            }
+        }
+    }
+
+    fn show_agent_profile_feedback(
+        &mut self,
+        kind: crate::app::state::ToastKind,
+        title: &str,
+        context: String,
+    ) {
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind,
+            title: title.to_string(),
+            context,
+            position: None,
+            target: None,
+        });
+        self.sync_toast_deadline(previous_toast);
     }
 }
 
@@ -114,6 +237,7 @@ fn cancel_settings(state: &mut AppState) {
     if let Some(theme_name) = state.settings.original_theme.take() {
         state.theme_name = theme_name;
     }
+    state.settings.agent_profile_form = None;
     super::modal::leave_modal(state);
 }
 
@@ -137,6 +261,10 @@ fn apply_settings(state: &mut AppState) -> Option<SettingsAction> {
             Some(SettingsAction::InstallRecommendedIntegrations)
         }
         SettingsSection::Integrations => None,
+        SettingsSection::Agents if state.settings.agent_profile_form.is_some() => {
+            return Some(SettingsAction::SaveAgentProfile);
+        }
+        SettingsSection::Agents => None,
         _ => {
             super::modal::leave_modal(state);
             None
@@ -145,6 +273,12 @@ fn apply_settings(state: &mut AppState) -> Option<SettingsAction> {
 }
 
 pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Option<SettingsAction> {
+    if state.settings.section == SettingsSection::Agents
+        && state.settings.agent_profile_form.is_some()
+    {
+        return update_agent_profile_form(state, key);
+    }
+
     match state.settings.section {
         SettingsSection::Theme => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -259,7 +393,7 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 state.settings.list.selected = toast_delivery_index(state.toast_delivery());
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                state.settings.section = SettingsSection::Integrations;
+                state.settings.section = SettingsSection::Agents;
                 state.settings.list.selected = 0;
             }
             _ => {
@@ -275,8 +409,8 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 return Some(SettingsAction::InstallRecommendedIntegrations);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::PaneLabels;
-                state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
+                state.settings.section = SettingsSection::Agents;
+                state.settings.list.selected = 0;
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Theme;
@@ -288,9 +422,125 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 _ => {}
             },
         },
+        SettingsSection::Agents => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => state
+                .settings
+                .list
+                .move_next(agent_settings_entry_count(state)),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return agent_settings_selected_action(state);
+            }
+            KeyCode::Char('e') => {
+                let selected = state.settings.list.selected;
+                if selected >= 3 {
+                    if let Some(profile) = state.saved_agent_profiles.get(selected - 3) {
+                        return Some(SettingsAction::OpenAgentEdit(profile.role.clone()));
+                    }
+                }
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::PaneLabels;
+                state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Integrations;
+                state.settings.list.selected = 0;
+            }
+            _ => match super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS) {
+                Some(super::modal::ModalAction::Close) => cancel_settings(state),
+                _ => {}
+            },
+        },
     }
 
     None
+}
+
+fn agent_settings_entry_count(state: &AppState) -> usize {
+    3 + state.saved_agent_profiles.len()
+}
+
+fn agent_settings_selected_action(state: &AppState) -> Option<SettingsAction> {
+    match state.settings.list.selected {
+        0 => Some(SettingsAction::OpenAgentCreate("codex".to_string())),
+        1 => Some(SettingsAction::OpenAgentCreate("pi".to_string())),
+        2 => Some(SettingsAction::OpenAgentCreate("claude".to_string())),
+        selected => state
+            .saved_agent_profiles
+            .get(selected - 3)
+            .map(|profile| SettingsAction::StartAgentProfile(profile.role.clone())),
+    }
+}
+
+fn update_agent_profile_form(state: &mut AppState, key: KeyEvent) -> Option<SettingsAction> {
+    let Some(form) = state.settings.agent_profile_form.as_mut() else {
+        return None;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.settings.agent_profile_form = None;
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            form.selected_field = form.selected_field.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            form.selected_field = (form.selected_field + 1).min(form.field_count() - 1);
+        }
+        KeyCode::Left => cycle_agent_profile_harness(form, false),
+        KeyCode::Right => cycle_agent_profile_harness(form, true),
+        KeyCode::Backspace => {
+            if let Some(value) = agent_profile_form_field_mut(form) {
+                value.pop();
+            }
+        }
+        KeyCode::Enter => return Some(SettingsAction::SaveAgentProfile),
+        KeyCode::Char(ch) if !ch.is_control() => {
+            if let Some(value) = agent_profile_form_field_mut(form) {
+                value.push(ch);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn agent_profile_form_field_mut(form: &mut AgentProfileForm) -> Option<&mut String> {
+    match (form.is_new(), form.selected_field) {
+        (true, 0) => Some(&mut form.role),
+        (true, 2) | (false, 1) => Some(&mut form.native_cwd),
+        (true, 3) => Some(&mut form.instructions),
+        _ => None,
+    }
+}
+
+fn cycle_agent_profile_harness(form: &mut AgentProfileForm, forward: bool) {
+    let harness_field = if form.is_new() { 1 } else { 0 };
+    if form.selected_field != harness_field {
+        return;
+    }
+    const HARNESSES: [&str; 3] = ["codex", "pi", "claude"];
+    let current = HARNESSES
+        .iter()
+        .position(|harness| *harness == form.harness)
+        .unwrap_or(0);
+    let next = if forward {
+        (current + 1) % HARNESSES.len()
+    } else {
+        (current + HARNESSES.len() - 1) % HARNESSES.len()
+    };
+    form.harness = HARNESSES[next].to_string();
+}
+
+pub(super) fn insert_agent_profile_form_text(state: &mut AppState, text: &str) -> bool {
+    let Some(form) = state.settings.agent_profile_form.as_mut() else {
+        return false;
+    };
+    let Some(value) = agent_profile_form_field_mut(form) else {
+        return false;
+    };
+    value.extend(text.chars().filter(|ch| !ch.is_control()));
+    true
 }
 
 pub(crate) fn open_settings(state: &mut AppState) {
@@ -308,6 +558,7 @@ pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
         SettingsSection::Sound => usize::from(!state.sound_enabled()),
         SettingsSection::Toast => toast_delivery_index(state.toast_delivery()),
         SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
+        SettingsSection::Agents => 0,
         SettingsSection::Integrations => 0,
     };
     state.mode = Mode::Settings;
@@ -402,6 +653,18 @@ impl AppState {
                     None
                 }
             }
+            SettingsSection::Agents => {
+                if self.settings.agent_profile_form.is_some() {
+                    return None;
+                }
+                let list_y = area.y + 3;
+                let count = agent_settings_entry_count(self) as u16;
+                if row >= list_y && row < list_y.saturating_add(count) {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
             SettingsSection::Integrations => None,
         }
     }
@@ -410,6 +673,9 @@ impl AppState {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(section) = self.settings_tab_at(mouse.column, mouse.row) {
+                    if section != SettingsSection::Agents {
+                        self.settings.agent_profile_form = None;
+                    }
                     self.settings.section = section;
                     self.settings.list.select(match section {
                         SettingsSection::Theme => current_theme_index(&self.theme_name),
@@ -421,9 +687,20 @@ impl AppState {
                         SettingsSection::PaneLabels => {
                             usize::from(!self.agent_border_labels_enabled())
                         }
+                        SettingsSection::Agents => 0,
                         SettingsSection::Integrations => 0,
                     });
                     return None;
+                }
+                if self.settings.section == SettingsSection::Agents
+                    && self.settings.agent_profile_form.is_some()
+                {
+                    if let Some(field) = self.agent_profile_form_field_at(mouse.row) {
+                        if let Some(form) = self.settings.agent_profile_form.as_mut() {
+                            form.selected_field = field;
+                        }
+                        return None;
+                    }
                 }
                 if let Some(idx) = self.settings_list_index_at(mouse.column, mouse.row) {
                     self.settings.list.select(idx);
@@ -447,6 +724,7 @@ impl AppState {
                             let enabled = idx == 0;
                             Some(SettingsAction::SaveAgentBorderLabels(enabled))
                         }
+                        SettingsSection::Agents => agent_settings_selected_action(self),
                         SettingsSection::Integrations => None,
                     };
                 }
@@ -473,6 +751,18 @@ impl AppState {
             }
             _ => None,
         }
+    }
+
+    fn agent_profile_form_field_at(&self, row: u16) -> Option<usize> {
+        let form = self.settings.agent_profile_form.as_ref()?;
+        let area = self.settings_content_rect();
+        let first_field_y = if form.is_new() {
+            area.y + 3
+        } else {
+            area.y + 4
+        };
+        let offset = row.checked_sub(first_field_y)? as usize;
+        (offset < form.field_count()).then_some(offset)
     }
 }
 
@@ -517,6 +807,117 @@ mod tests {
     }
 
     #[test]
+    fn agents_settings_creates_with_each_native_harness_and_starts_saved_profiles() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.saved_agent_profiles = vec![crate::app::state::SavedAgentProfile {
+            role: "reviewer".to_string(),
+            native_cwd: "/tmp/reviewer".to_string(),
+            harness: "claude".to_string(),
+            replicas_assigned: 0,
+        }];
+        open_settings_at(&mut state, SettingsSection::Agents);
+
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::OpenAgentCreate("codex".to_string()))
+        );
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::OpenAgentCreate("pi".to_string()))
+        );
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::OpenAgentCreate("claude".to_string()))
+        );
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::StartAgentProfile("reviewer".to_string()))
+        );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::OpenAgentEdit("reviewer".to_string()))
+        );
+    }
+
+    #[test]
+    fn agent_profile_form_edits_its_selected_field_and_cycles_harness() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Agents);
+        state.settings.agent_profile_form = Some(AgentProfileForm {
+            existing_role: None,
+            role: String::new(),
+            harness: "codex".to_string(),
+            native_cwd: "/tmp".to_string(),
+            instructions: String::new(),
+            selected_field: 0,
+        });
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
+        );
+        assert_eq!(
+            state.settings.agent_profile_form.as_ref().unwrap().role,
+            "r"
+        );
+        assert!(insert_agent_profile_form_text(&mut state, "eviewer"));
+        assert_eq!(
+            state.settings.agent_profile_form.as_ref().unwrap().role,
+            "reviewer"
+        );
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            state.settings.agent_profile_form.as_ref().unwrap().harness,
+            "pi"
+        );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::SaveAgentProfile)
+        );
+    }
+
+    #[test]
     fn settings_indicator_choice_returns_save_action() {
         let mut state = state_with_workspaces(&["test"]);
         open_settings_at(&mut state, SettingsSection::Indicators);
@@ -555,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_tab_cycle_wraps_after_integrations() {
+    fn settings_tab_cycle_includes_agents_before_integrations() {
         let mut state = state_with_workspaces(&["test"]);
         open_settings_at(&mut state, SettingsSection::PaneLabels);
 
@@ -563,25 +964,31 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
         );
-        assert_eq!(state.settings.section, SettingsSection::Integrations);
+        assert_eq!(state.settings.section, SettingsSection::Agents);
 
         update_settings_state(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
         );
-        assert_eq!(state.settings.section, SettingsSection::Theme);
+        assert_eq!(state.settings.section, SettingsSection::Integrations);
 
         update_settings_state(
             &mut state,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
-        assert_eq!(state.settings.section, SettingsSection::Integrations);
+        assert_eq!(state.settings.section, SettingsSection::Agents);
 
         update_settings_state(
             &mut state,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
         assert_eq!(state.settings.section, SettingsSection::PaneLabels);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.section, SettingsSection::Toast);
     }
 
     #[test]

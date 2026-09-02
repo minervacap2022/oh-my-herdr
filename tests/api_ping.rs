@@ -49,6 +49,72 @@ impl Drop for SpawnedHerdr {
     }
 }
 
+#[cfg(unix)]
+struct DescendantCleanup {
+    pid_file: PathBuf,
+    pid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl DescendantCleanup {
+    fn new(pid_file: PathBuf) -> Self {
+        Self {
+            pid_file,
+            pid: None,
+        }
+    }
+
+    fn track(&mut self, pid: u32) {
+        self.pid = Some(pid);
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DescendantCleanup {
+    fn drop(&mut self) {
+        let pid = self
+            .pid
+            .take()
+            .or_else(|| fs::read_to_string(&self.pid_file).ok()?.trim().parse().ok());
+        let Some(pid) = pid else {
+            return;
+        };
+        if !process_exists(pid) {
+            return;
+        }
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while process_exists(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !process_exists(pid),
+        "descendant process {pid} remained alive after its pane leader exited"
+    );
+}
+
 fn cleanup_spawned_herdr(spawned: SpawnedHerdr, base: PathBuf) {
     drop(spawned);
     cleanup_test_base(&base);
@@ -72,7 +138,7 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn wait_for_path(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -213,9 +279,29 @@ impl JsonLineReader {
 }
 
 fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
+    send_request_with_timeout(socket_path, json, Duration::from_secs(5))
+}
+
+fn send_request_with_timeout(
+    socket_path: &Path,
+    json: &str,
+    timeout: Duration,
+) -> serde_json::Value {
     let mut reader = JsonLineReader::connect(socket_path);
     reader.send_line(json);
-    reader.read_json_line(Duration::from_secs(5))
+    reader.read_json_line(timeout)
+}
+
+fn wait_for_api_ready(socket_path: &Path, timeout: Duration) {
+    let response = send_request_with_timeout(
+        socket_path,
+        r#"{"id":"api_ready","method":"workspace.list","params":{}}"#,
+        timeout,
+    );
+    assert!(
+        response.get("result").is_some(),
+        "server did not become ready: {response}"
+    );
 }
 
 fn open_subscription(socket_path: &Path, json: &str) -> JsonLineReader {
@@ -310,6 +396,26 @@ fn ping_over_socket_returns_version() {
 }
 
 #[test]
+fn agent_profile_get_rejects_invalid_role_over_socket() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let response = send_request(
+        &socket_path,
+        r#"{"id":"invalid-profile-role","method":"agent.profile.get","params":{"role":"Reviewer!"}}"#,
+    );
+
+    assert_eq!(response["error"]["code"], "invalid_profile_role");
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
 fn server_reload_agent_manifests_reports_runtime_override() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -319,6 +425,7 @@ fn server_reload_agent_manifests_reports_runtime_override() {
 
     let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_api_ready(&socket_path, Duration::from_secs(10));
 
     let override_dir = config_home.join("herdr-dev").join("agent-detection");
     fs::create_dir_all(&override_dir).unwrap();
@@ -395,6 +502,7 @@ fn workspace_list_and_create_round_trip() {
         .as_str()
         .unwrap()
         .to_string();
+    thread::sleep(Duration::from_millis(750));
     let root_terminal_id = created["result"]["root_pane"]["terminal_id"]
         .as_str()
         .unwrap()
@@ -590,6 +698,65 @@ fn workspace_list_and_create_round_trip() {
         ),
     );
     assert_eq!(timeout["error"]["code"], "timeout");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(unix)]
+#[test]
+fn reaped_pane_leader_terminates_captured_session_descendants() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let descendant_pid_file = base.join("descendant.pid");
+    let release_file = base.join("release-leader");
+    let mut descendant_cleanup = DescendantCleanup::new(descendant_pid_file.clone());
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let workspace = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "descendant_workspace",
+            "method": "workspace.create",
+            "params": { "cwd": base.display().to_string(), "focus": true }
+        })
+        .to_string(),
+    );
+    let pane_id = workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("workspace creation should return a root pane ID");
+    let command = format!(
+        "exec /bin/sh -c 'trap \"\" HUP; sleep 60 & descendant=$!; printf \"%s\\n\" \"$descendant\" > {}; while [ ! -e {} ]; do sleep 0.05; done'",
+        descendant_pid_file.display(),
+        release_file.display(),
+    );
+
+    let send_input = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "spawn_descendant",
+            "method": "pane.send_input",
+            "params": { "pane_id": pane_id, "text": command, "keys": ["Enter"] }
+        })
+        .to_string(),
+    );
+    assert_eq!(send_input["result"]["type"], "ok", "{send_input}");
+
+    wait_for_path(&descendant_pid_file, Duration::from_secs(5));
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("pane script should write its descendant PID")
+        .trim()
+        .parse::<u32>()
+        .expect("descendant PID should be numeric");
+    descendant_cleanup.track(descendant_pid);
+
+    fs::write(&release_file, "release").expect("release file should let the pane leader exit");
+    wait_for_process_exit(descendant_pid, Duration::from_secs(5));
+    descendant_cleanup.disarm();
 
     cleanup_spawned_herdr(child, base);
 }
@@ -1025,7 +1192,14 @@ fn agent_start_targets_existing_pane_over_socket() {
     fs::write(&fake_pi, "#!/bin/sh\nHERDR_AGENT=pi exec /bin/sleep 20\n").unwrap();
     fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let child = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path_override = format!("{}:{inherited_path}", bin.display());
+    let child = spawn_herdr_with_path(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(Path::new(&path_override)),
+    );
     wait_for_socket(&socket_path, Duration::from_secs(5));
     let workspace = send_request(
         &socket_path,
@@ -1087,6 +1261,128 @@ fn agent_start_targets_existing_pane_over_socket() {
         .as_str()
         .unwrap()
         .contains(&terminal_id));
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn agent_spawn_assigns_a_replica_and_auto_splits_for_a_running_role() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\nexport HERDR_AGENT=pi\nwhile IFS= read -r _prompt; do :; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path_override = format!("{}:{inherited_path}", bin.display());
+    let child = spawn_herdr_with_path(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        Some(Path::new(&path_override)),
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"workspace","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let root_pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let first = send_request(
+        &socket_path,
+        r#"{"id":"first","method":"agent.spawn","params":{"role":"reviewer","kind":"pi","timeout_ms":5000}}"#,
+    );
+    assert_eq!(first["result"]["type"], "agent_spawned", "{first}");
+    assert_eq!(first["result"]["spawned"]["name"], "reviewer");
+    assert_eq!(first["result"]["spawned"]["pane_id"], root_pane_id);
+    assert_eq!(first["result"]["spawned"]["split"], false);
+
+    let second = send_request(
+        &socket_path,
+        r#"{"id":"second","method":"agent.spawn","params":{"role":"reviewer","kind":"pi","timeout_ms":5000}}"#,
+    );
+    assert_eq!(second["result"]["type"], "agent_spawned", "{second}");
+    assert_eq!(second["result"]["spawned"]["name"], "reviewer-replica-1");
+    assert_eq!(second["result"]["spawned"]["split"], true);
+    assert_ne!(second["result"]["spawned"]["pane_id"], root_pane_id);
+
+    let panes = send_request(
+        &socket_path,
+        r#"{"id":"panes","method":"pane.list","params":{}}"#,
+    );
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 2);
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn invalid_agent_spawn_does_not_leave_an_orphaned_split_pane() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\nexport HERDR_AGENT=pi\nwhile IFS= read -r _prompt; do :; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let child = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let workspace = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"workspace","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert!(workspace.get("error").is_none(), "{workspace}");
+    let first = send_request(
+        &socket_path,
+        r#"{"id":"first","method":"agent.spawn","params":{"role":"reviewer","kind":"pi","timeout_ms":5000}}"#,
+    );
+    assert!(first.get("error").is_none(), "{first}");
+
+    let invalid = send_request(
+        &socket_path,
+        r#"{"id":"invalid","method":"agent.spawn","params":{"role":"reviewer","kind":"pi","timeout_ms":3000}}"#,
+    );
+    assert_eq!(
+        invalid["error"]["code"], "invalid_agent_timeout",
+        "{invalid}"
+    );
+
+    let panes = send_request(
+        &socket_path,
+        r#"{"id":"panes","method":"pane.list","params":{}}"#,
+    );
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 1);
 
     cleanup_spawned_herdr(child, base);
 }
@@ -2370,8 +2666,9 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     let send_pi = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_status_3","method":"pane.send_text","params":{{"pane_id":"{}","text":"pi"}}}}"#,
-            background_pane_id
+            r#"{{"id":"req_status_3","method":"pane.send_text","params":{{"pane_id":"{}","text":"{}"}}}}"#,
+            background_pane_id,
+            fake_pi.display()
         ),
     );
     assert_eq!(send_pi["result"]["type"], "ok");

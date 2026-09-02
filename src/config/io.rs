@@ -20,8 +20,19 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
 ];
 
 pub fn app_dir_name() -> &'static str {
+    if option_env!("OHMYHERDR_BUILD") == Some("1") {
+        return "ohmyherdr";
+    }
     if cfg!(debug_assertions) {
         "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
+pub fn product_name() -> &'static str {
+    if option_env!("OHMYHERDR_BUILD") == Some("1") {
+        "ohmyherdr"
     } else {
         "herdr"
     }

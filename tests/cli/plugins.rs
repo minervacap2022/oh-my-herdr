@@ -486,6 +486,46 @@ command = ["sh", "-c", "echo bootstrap"]
         "build command should not inherit HERDR_SESSION"
     );
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let managed_parent = managed_path.parent().unwrap();
+        let original_mode = fs::metadata(managed_parent).unwrap().permissions().mode();
+        fs::set_permissions(
+            managed_parent,
+            fs::Permissions::from_mode(original_mode & !0o222),
+        )
+        .unwrap();
+        let failed_uninstall = run_named_cli(
+            &config_home,
+            &runtime_dir,
+            &[
+                "--session",
+                "third",
+                "plugin",
+                "uninstall",
+                "example.worktree-bootstrap",
+            ],
+        );
+        fs::set_permissions(managed_parent, fs::Permissions::from_mode(original_mode)).unwrap();
+
+        assert!(
+            !failed_uninstall.status.success(),
+            "uninstall should fail when its managed checkout cannot be removed"
+        );
+        let listed_after_failed_uninstall = run_named_cli_json(
+            &config_home,
+            &runtime_dir,
+            &["--session", "other", "plugin", "list", "--json"],
+        );
+        assert_eq!(
+            listed_after_failed_uninstall["result"]["plugins"][0]["plugin_id"],
+            "example.worktree-bootstrap",
+            "a failed checkout cleanup must leave the plugin registered for retry"
+        );
+    }
+
     let uninstall = run_named_cli(
         &config_home,
         &runtime_dir,

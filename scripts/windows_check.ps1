@@ -76,12 +76,36 @@ function Invoke-CargoTestFilter {
     Invoke-Checked cargo $runArguments
 }
 
+function Invoke-CargoIntegrationTest {
+    param([Parameter(Mandatory)][string]$TestTarget)
+
+    Invoke-Checked cargo @(
+        "test",
+        "--locked",
+        "--target",
+        "x86_64-pc-windows-msvc",
+        "--test",
+        $TestTarget
+    )
+}
+
 Invoke-Checked rustup @("target", "add", "x86_64-pc-windows-msvc")
 Invoke-Checked cargo @("fmt", "--check")
 Invoke-CargoWithZigCacheRecovery @(
     "clippy",
     "--bin",
     "herdr",
+    "--locked",
+    "--target",
+    "x86_64-pc-windows-msvc",
+    "--",
+    "-D",
+    "warnings"
+)
+Invoke-CargoWithZigCacheRecovery @(
+    "clippy",
+    "--test",
+    "windows_agent_registry",
     "--locked",
     "--target",
     "x86_64-pc-windows-msvc",
@@ -97,4 +121,5 @@ if ($Mode -eq "lint") {
 Invoke-CargoTestFilter "windows_"
 Invoke-CargoTestFilter "server::client_transport::tests"
 Invoke-CargoTestFilter "app::tests::native_repeats_and_releases_follow_the_pressed_pane" -Exact
+Invoke-CargoIntegrationTest "windows_agent_registry"
 Invoke-Checked cargo @("build", "--locked", "--target", "x86_64-pc-windows-msvc")

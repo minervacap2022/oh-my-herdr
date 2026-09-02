@@ -456,7 +456,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
             return Err(err.to_string());
         }
     }
-    fs::rename(&tmp_path, path).map_err(|err| {
+    crate::platform::replace_file(&tmp_path, path).map_err(|err| {
         let _ = fs::remove_file(&tmp_path);
         err.to_string()
     })?;

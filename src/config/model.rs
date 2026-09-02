@@ -1073,8 +1073,10 @@ impl Default for KeysConfig {
             cycle_pane_next: BindingConfig::one("prefix+tab"),
             cycle_pane_previous: BindingConfig::one("prefix+shift+tab"),
             last_pane: BindingConfig::empty(),
-            split_vertical: BindingConfig::one("prefix+v"),
-            split_horizontal: BindingConfig::one("prefix+minus"),
+            // Agent profiles own normal pane creation in the product UX.
+            // Explicit user bindings and the pane.split API remain available.
+            split_vertical: BindingConfig::empty(),
+            split_horizontal: BindingConfig::empty(),
             close_pane: BindingConfig::one("prefix+x"),
             zoom: BindingConfig::one("prefix+z"),
             resize_mode: BindingConfig::one("prefix+r"),

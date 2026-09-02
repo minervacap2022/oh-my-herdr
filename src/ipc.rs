@@ -1,8 +1,13 @@
 use std::fs;
 use std::io::{self, Read};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as _;
@@ -131,10 +136,141 @@ pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) 
     }
 }
 
+pub(crate) struct DeadlineLocalStreamReader<'stream> {
+    stream: &'stream mut LocalStream,
+    deadline: Instant,
+    timeout_message: &'static str,
+    restore_polling: bool,
+    needs_blocking_restore: bool,
+}
+
+impl<'stream> DeadlineLocalStreamReader<'stream> {
+    pub(crate) fn new(
+        stream: &'stream mut LocalStream,
+        deadline: Instant,
+        timeout_message: &'static str,
+    ) -> io::Result<Self> {
+        let restore_polling = local_stream_polling(stream)?;
+        set_local_stream_polling(stream, true)?;
+        Ok(Self {
+            stream,
+            deadline,
+            timeout_message,
+            restore_polling,
+            needs_blocking_restore: true,
+        })
+    }
+
+    pub(crate) fn restore_stream_mode(&mut self) -> io::Result<()> {
+        set_local_stream_polling(self.stream, self.restore_polling)?;
+        self.needs_blocking_restore = false;
+        Ok(())
+    }
+
+    fn timeout_error(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, self.timeout_message)
+    }
+}
+
+impl Drop for DeadlineLocalStreamReader<'_> {
+    fn drop(&mut self) {
+        if self.needs_blocking_restore {
+            let _ = set_local_stream_polling(self.stream, self.restore_polling);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn local_stream_polling(stream: &LocalStream) -> io::Result<bool> {
+    let LocalStream::UdSocket(stream) = stream;
+    let flags = unsafe { libc::fcntl(stream.inner().as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & libc::O_NONBLOCK != 0)
+}
+
+#[cfg(windows)]
+fn local_stream_polling(_stream: &LocalStream) -> io::Result<bool> {
+    Ok(false)
+}
+
+impl Read for DeadlineLocalStreamReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timeout_error());
+            }
+
+            match poll_local_stream_read_count(self.stream, buffer)? {
+                LocalStreamReadCount::Data(read) => {
+                    if Instant::now() >= self.deadline {
+                        return Err(self.timeout_error());
+                    }
+                    return Ok(read);
+                }
+                LocalStreamReadCount::Closed => return Ok(0),
+                LocalStreamReadCount::Pending => {
+                    let remaining = self.deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(self.timeout_error());
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn shutdown_local_stream_write(stream: &LocalStream) -> io::Result<()> {
     match stream {
         LocalStream::UdSocket(stream) => stream.inner().shutdown(std::net::Shutdown::Write),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalStreamRetirer {
+    stream: LocalStream,
+}
+
+impl LocalStreamRetirer {
+    pub(crate) fn new(stream: LocalStream) -> Self {
+        Self { stream }
+    }
+
+    pub(crate) fn retire(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            match &self.stream {
+                LocalStream::UdSocket(stream) => stream.inner().shutdown(std::net::Shutdown::Both),
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::{
+                Foundation::ERROR_PIPE_NOT_CONNECTED, System::Pipes::DisconnectNamedPipe,
+            };
+
+            match &self.stream {
+                LocalStream::NamedPipe(stream) => {
+                    if unsafe { DisconnectNamedPipe(stream.inner().as_raw_handle()) } != 0 {
+                        return Ok(());
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32) {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -347,6 +483,8 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use interprocess::local_socket::traits::Listener as _;
     #[cfg(windows)]
     use interprocess::local_socket::traits::Listener as _;
     #[cfg(windows)]
@@ -361,6 +499,83 @@ mod tests {
             stale_socket_connect_error(io::ErrorKind::WouldBlock),
             cfg!(windows)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_reader_restores_blocking_mode_when_dropped() {
+        use std::io::Write as _;
+
+        let path = Path::new("/tmp").join(format!(
+            "h{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = bind_local_listener(&path).unwrap();
+        let mut client = connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        server.set_nonblocking(false).unwrap();
+
+        {
+            let _reader = DeadlineLocalStreamReader::new(
+                &mut server,
+                Instant::now() + Duration::from_secs(1),
+                "unused",
+            )
+            .unwrap();
+        }
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            client.write_all(b"x").unwrap();
+            client.flush().unwrap();
+        });
+        let started = Instant::now();
+        let mut byte = [0_u8; 1];
+        let read = server.read(&mut byte).unwrap();
+
+        assert_eq!(read, 1);
+        assert_eq!(byte, [b'x']);
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        writer.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_reader_preserves_polling_mode_when_dropped() {
+        let path = Path::new("/tmp").join(format!(
+            "h{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = bind_local_listener(&path).unwrap();
+        let _client = connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        {
+            let _reader = DeadlineLocalStreamReader::new(
+                &mut server,
+                Instant::now() + Duration::from_secs(1),
+                "unused",
+            )
+            .unwrap();
+        }
+
+        let mut byte = [0_u8; 1];
+        let error = server.read(&mut byte).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let _ = fs::remove_file(path);
     }
 
     #[cfg(windows)]

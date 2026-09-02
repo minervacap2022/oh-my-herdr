@@ -96,14 +96,33 @@ fn spawn_server_with_path(
     api_socket_path: &Path,
     path_override: Option<&Path>,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    spawn_server_with_path_and_config(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        path_override,
+        "onboarding = false\n",
+        None,
+    )
+}
+
+fn spawn_server_with_path_and_config(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
+    path_override: Option<&Path>,
+    config: &str,
+    session_name: Option<&str>,
+) -> SpawnedHerdr {
+    let config_dir = config_home.join(if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    });
+    fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
-    fs::write(
-        config_home.join("herdr/config.toml"),
-        "onboarding = false\n",
-    )
-    .unwrap();
+    fs::write(config_dir.join("config.toml"), config).unwrap();
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -122,6 +141,10 @@ fn spawn_server_with_path(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    match session_name {
+        Some(name) => cmd.env("HERDR_SESSION", name),
+        None => cmd.env_remove("HERDR_SESSION"),
+    };
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
@@ -198,6 +221,31 @@ fn workspace_create(socket_path: &Path, label: &str) -> Value {
         "workspace.create",
         json!({ "label": label }),
     )
+}
+
+fn spawn_agent_when_ready(
+    socket_path: &Path,
+    request_id: &str,
+    params: Value,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let response = send_json_request(socket_path, request_id, "agent.spawn", params.clone());
+        if response.get("result").is_some() {
+            return response;
+        }
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_str),
+            Some("agent_spawn_failed"),
+            "agent.spawn failed unexpectedly: {response}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "agent pane did not become available: {response}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn workspace_list(socket_path: &Path) -> Value {
@@ -329,6 +377,48 @@ fn pane_agent_status(socket_path: &Path, pane_id: &str) -> Option<String> {
     response["result"]["pane"]["agent_status"]
         .as_str()
         .map(|status| status.to_string())
+}
+
+fn wait_for_agent_label(
+    socket_path: &Path,
+    pane_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let response = send_json_request(
+            socket_path,
+            "pane_get_agent",
+            "pane.get",
+            json!({ "pane_id": pane_id }),
+        );
+        if response["result"]["pane"]["agent"].as_str() == Some(expected) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn wait_for_agent_interactive_ready(socket_path: &Path, target: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let response = send_json_request(
+            socket_path,
+            "agent_get_ready",
+            "agent.get",
+            json!({ "target": target }),
+        );
+        let agent = &response["result"]["agent"];
+        if agent["interactive_ready"].as_bool() == Some(true)
+            && agent["launch_pending"].as_bool() != Some(true)
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 fn wait_for_agent_status(
@@ -558,8 +648,12 @@ fn frame_contains_colored_symbol(frame: &FrameWire, symbol: &str, rgb: (u8, u8, 
 }
 
 fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
+    frame_text(frame).contains(needle)
+}
+
+fn frame_text(frame: &FrameWire) -> String {
     if frame.cells.is_empty() {
-        return false;
+        return String::new();
     }
 
     let width = frame.width.max(1) as usize;
@@ -576,7 +670,28 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
         let _ = (cursor.x, cursor.y, cursor.visible, cursor.shape);
     }
 
-    text.contains(needle)
+    text
+}
+
+fn frame_row_containing(frame: &FrameWire, first: &str, second: &str) -> Option<usize> {
+    let width = frame.width.max(1) as usize;
+    frame.cells.chunks(width).position(|row| {
+        let text: String = row.iter().map(|cell| cell.symbol.as_str()).collect();
+        text.contains(first) && text.contains(second)
+    })
+}
+
+fn frame_row_contains(frame: &FrameWire, row: usize, first: &str, second: &str) -> bool {
+    let width = frame.width.max(1) as usize;
+    frame
+        .cells
+        .chunks(width)
+        .nth(row)
+        .map(|cells| {
+            let text: String = cells.iter().map(|cell| cell.symbol.as_str()).collect();
+            text.contains(first) && text.contains(second)
+        })
+        .unwrap_or(false)
 }
 
 fn read_server_variant(stream: &mut UnixStream, timeout: Duration) -> io::Result<u32> {
@@ -756,6 +871,82 @@ fn cross_area_detach_and_reattach_preserves_state() {
 }
 
 #[test]
+fn cross_area_session_autosave_recovers_after_live_storage_failure() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let session_name = "autosave-retry";
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let session_dir = config_home
+        .join(app_dir)
+        .join("sessions")
+        .join(session_name);
+    std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+    std::fs::write(&session_dir, "blocked session storage").unwrap();
+
+    let server = spawn_server_with_path_and_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        None,
+        "onboarding = false\n",
+        Some(session_name),
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let mut client = UnixStream::connect(&client_socket).expect("client should connect");
+    client_handshake(&mut client, CURRENT_PROTOCOL, 100, 30);
+    assert!(wait_for_frame(&mut client, Duration::from_secs(2)));
+
+    let label = "autosave-after-recovery";
+    let created = workspace_create(&api_socket, label);
+    assert!(created.get("error").is_none(), "{created}");
+
+    thread::sleep(Duration::from_secs(6));
+    assert!(
+        session_dir.is_file(),
+        "blocked session storage should still prevent the first autosave"
+    );
+    assert!(
+        ping_socket(&api_socket).contains("pong"),
+        "server should remain responsive while autosave storage is unavailable"
+    );
+
+    std::fs::remove_file(&session_dir).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let session_path = session_dir.join("session.json");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut persisted = false;
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(&session_path).is_ok_and(|snapshot| snapshot.contains(label)) {
+            persisted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        persisted,
+        "live server should persist the API-created workspace after storage recovers"
+    );
+
+    let listed = workspace_list(&api_socket);
+    assert_eq!(
+        workspace_id_by_label(&listed, label),
+        created["result"]["workspace"]["workspace_id"]
+    );
+
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
 fn cross_area_agent_process_survives_detach_and_reattach() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -876,6 +1067,183 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 }
 
 #[test]
+fn cross_area_spawned_replica_done_click_marks_seen_idle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let bin_dir = base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let fake_pi = bin_dir.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\nexport HERDR_AGENT=pi\nwhile IFS= read -r _prompt; do :; done\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_pi).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_pi, permissions).unwrap();
+
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path_override = format!("{}:{inherited_path}", bin_dir.display());
+    let config = "onboarding = false\n[ui]\nsidebar_width = 36\nsidebar_min_width = 36\nsidebar_max_width = 36\n[ui.sidebar.agents]\nrow_gap = 0\nrows = [[\"state_text\", \"agent\"]]\n";
+    let server = spawn_server_with_path_and_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        Some(Path::new(&path_override)),
+        config,
+        None,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let mut client = UnixStream::connect(&client_socket).expect("client should connect");
+    client_handshake(&mut client, CURRENT_PROTOCOL, 120, 40);
+    assert!(wait_for_frame(&mut client, Duration::from_secs(2)));
+    drain_server_messages(&mut client, Duration::from_millis(250));
+
+    let created = workspace_create(&api_socket, "spawn-sidebar");
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let first = spawn_agent_when_ready(
+        &api_socket,
+        "spawn_first",
+        json!({ "role": "reviewer", "kind": "pi", "timeout_ms": 8000 }),
+        Duration::from_secs(8),
+    );
+    assert_eq!(first["result"]["type"], "agent_spawned", "{first}");
+    assert_eq!(first["result"]["spawned"]["name"], "reviewer", "{first}");
+
+    let second = spawn_agent_when_ready(
+        &api_socket,
+        "spawn_second",
+        json!({ "role": "reviewer", "kind": "pi", "timeout_ms": 8000 }),
+        Duration::from_secs(8),
+    );
+    assert_eq!(second["result"]["type"], "agent_spawned", "{second}");
+    assert_eq!(
+        second["result"]["spawned"]["name"], "reviewer-replica-1",
+        "{second}"
+    );
+    assert_eq!(second["result"]["spawned"]["split"], true, "{second}");
+    let replica_pane_id = second["result"]["spawned"]["pane_id"]
+        .as_str()
+        .expect("replica pane id")
+        .to_string();
+
+    let background_tab = send_json_request(
+        &api_socket,
+        "background_tab",
+        "tab.create",
+        json!({ "workspace_id": workspace_id, "label": "background", "focus": true }),
+    );
+    assert!(background_tab.get("error").is_none(), "{background_tab}");
+
+    assert!(
+        wait_for_agent_label(&api_socket, &replica_pane_id, "pi", Duration::from_secs(5)),
+        "replica should be process-detected before reporting its lifecycle state"
+    );
+    pane_report_agent(&api_socket, &replica_pane_id, "pi", "idle", "spawn-sidebar");
+    assert!(
+        wait_for_agent_interactive_ready(&api_socket, &replica_pane_id, Duration::from_secs(5)),
+        "replica should settle its initial managed launch state"
+    );
+    pane_report_agent(
+        &api_socket,
+        &replica_pane_id,
+        "pi",
+        "working",
+        "spawn-sidebar",
+    );
+    assert!(
+        wait_for_agent_status(
+            &api_socket,
+            &replica_pane_id,
+            "working",
+            Duration::from_secs(5)
+        ),
+        "replica should publish working while its tab is backgrounded"
+    );
+    pane_report_agent(&api_socket, &replica_pane_id, "pi", "idle", "spawn-sidebar");
+    assert!(
+        wait_for_agent_status(
+            &api_socket,
+            &replica_pane_id,
+            "done",
+            Duration::from_secs(5)
+        ),
+        "replica should publish done while its tab is backgrounded"
+    );
+    let replica_before_click = send_json_request(
+        &api_socket,
+        "replica_before_click",
+        "pane.get",
+        json!({ "pane_id": replica_pane_id }),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut replica_row = None;
+    let mut last_frame = String::new();
+    while Instant::now() < deadline {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        match read_server_message_payload(&mut client, remaining) {
+            Ok((1, payload)) => {
+                let frame = decode_frame_payload(&payload).expect("frame decoding should succeed");
+                last_frame = frame_text(&frame);
+                if let Some(row) = frame_row_containing(&frame, "done", "reviewer-replica-1") {
+                    replica_row = Some(row);
+                    break;
+                }
+            }
+            Ok((_variant, _payload)) => {}
+            Err(err) if is_timeout(&err) => {}
+            Err(err) => panic!("failed while waiting for done replica row: {err}"),
+        }
+    }
+    let replica_row = replica_row.unwrap_or_else(|| {
+        panic!(
+            "background idle replica should render as done; pane={replica_before_click}; last frame:\n{last_frame}"
+        )
+    });
+
+    let click = format!("\x1b[<0;2;{}M", replica_row + 1);
+    send_client_input(&mut client, click.as_bytes());
+
+    assert!(
+        wait_for_frame_matching(&mut client, Duration::from_secs(5), |frame| {
+            frame_row_contains(frame, replica_row, "idle", "reviewer-replica-1")
+        })
+        .expect("frame decoding should succeed"),
+        "sidebar click should mark the replica row seen and idle"
+    );
+
+    let replica = send_json_request(
+        &api_socket,
+        "replica_after_click",
+        "pane.get",
+        json!({ "pane_id": replica_pane_id }),
+    );
+    assert_eq!(replica["result"]["pane"]["focused"], true, "{replica}");
+    assert_eq!(
+        replica["result"]["pane"]["agent_status"], "idle",
+        "{replica}"
+    );
+
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
 fn cross_area_client_and_api_workspace_views_are_consistent() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -962,10 +1330,22 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     drain_server_messages(&mut client_b, Duration::from_millis(250));
 
     let created = workspace_create(&api_socket, "shared-view");
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace id");
     let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
         .expect("root pane id")
         .to_string();
+    let focused = send_json_request(
+        &api_socket,
+        "workspace_focus",
+        "workspace.focus",
+        json!({ "workspace_id": workspace_id }),
+    );
+    assert!(focused.get("error").is_none(), "{focused}");
+    drain_server_messages(&mut client_a, Duration::from_millis(250));
+    drain_server_messages(&mut client_b, Duration::from_millis(250));
 
     // Input from client A should update shared state visible to client B.
     send_client_input(&mut client_a, b"echo SHARED_VIEW\n");

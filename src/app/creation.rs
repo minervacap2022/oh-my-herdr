@@ -98,12 +98,7 @@ impl App {
 
     pub(super) fn begin_tui_workspace_create(&mut self, request_id: &'static str) {
         if self.state.prompt_new_workspace_name {
-            let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
-                self.focused_pane_cwd_in_workspace(ws_idx)
-                    .or_else(|| self.seed_cwd_from_workspace(ws_idx))
-            });
-            let cwd = self.resolve_new_terminal_cwd(follow_cwd);
-            super::input::open_new_workspace_dialog(&mut self.state, cwd);
+            super::input::open_new_workspace_dialog(&mut self.state);
             return;
         }
 

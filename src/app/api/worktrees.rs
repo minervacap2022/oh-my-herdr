@@ -724,6 +724,8 @@ mod tests {
     use crate::api::schema::{
         ErrorResponse, Request, SuccessResponse, WorktreeCreateParams, WorktreeRemoveParams,
     };
+    #[cfg(unix)]
+    use crate::api::schema::{Method, PluginActionInvokeParams, PluginManifestAction};
     use crate::events::{
         ApiWorktreeAddRequest, ApiWorktreeRemoveRequest, AppEvent, WorktreeAddResult,
         WorktreeRemoveResult,
@@ -1955,6 +1957,151 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(plugin_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_remove_waits_for_plugin_command_from_checkout() {
+        let repo = create_committed_repo("api-worktree-plugin-lease-repo");
+        let checkout = unique_temp_path("api-worktree-plugin-lease-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/plugin-lease",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let mut app = test_app();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = checkout.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(&repo).unwrap().key,
+            label: "api-worktree-plugin-lease-repo".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let child_id = child.id.clone();
+        app.state.workspaces.push(child);
+        app.state.ensure_test_terminals();
+
+        let plugin_root = checkout.join("plugin");
+        let started = plugin_root.join("started");
+        let release = plugin_root.join("release");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        app.state.installed_plugins.insert(
+            "example.hold".into(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example.hold".into(),
+                name: "Hold".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: "0.7.0".into(),
+                description: None,
+                manifest_path: plugin_root.join("herdr-plugin.toml").display().to_string(),
+                plugin_root: plugin_root.display().to_string(),
+                enabled: true,
+                platforms: None,
+                build: Vec::new(),
+                startup: Vec::new(),
+                actions: vec![PluginManifestAction {
+                    id: "hold".into(),
+                    title: "Hold".into(),
+                    description: None,
+                    contexts: Vec::new(),
+                    platforms: None,
+                    command: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        format!(
+                            "touch {}; while [ ! -e {} ]; do sleep 0.01; done",
+                            started.display(),
+                            release.display()
+                        ),
+                    ],
+                }],
+                events: Vec::new(),
+                panes: Vec::new(),
+                link_handlers: Vec::new(),
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: Vec::new(),
+            },
+        );
+
+        let invoke = app.handle_api_request(Request {
+            id: "invoke".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.hold".into()),
+                action_id: "hold".into(),
+                context: None,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&invoke).unwrap();
+        let crate::api::schema::ResponseResult::PluginActionInvoked { log, .. } = success.result
+        else {
+            panic!("expected plugin action invocation: {invoke}");
+        };
+        let started_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < started_deadline,
+                "plugin command did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(app.state.plugin_commands_in_flight, 1);
+        assert_eq!(app.state.plugin_command_root_leases.len(), 1);
+
+        let blocked = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "remove-blocked".into(),
+                method: Method::WorktreeRemove(WorktreeRemoveParams {
+                    workspace_id: child_id.clone(),
+                    force: true,
+                }),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(error.error.code, "plugin_command_in_progress");
+        assert!(checkout.exists());
+
+        std::fs::write(&release, b"release").unwrap();
+        let event = wait_for_app_event(&mut app);
+        app.handle_internal_event(event);
+        assert_eq!(app.state.plugin_commands_in_flight, 0);
+        assert!(app.state.plugin_command_root_leases.is_empty());
+        assert!(app.state.plugin_command_lease_roots.is_empty());
+        assert!(app
+            .state
+            .plugin_command_logs
+            .iter()
+            .any(|entry| entry.log_id == log.log_id
+                && entry.status == crate::api::schema::PluginCommandStatus::Succeeded));
+
+        let removed = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "remove".into(),
+                method: Method::WorktreeRemove(WorktreeRemoveParams {
+                    workspace_id: child_id,
+                    force: true,
+                }),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&removed).unwrap();
+        assert!(matches!(
+            success.result,
+            crate::api::schema::ResponseResult::WorktreeRemoved { .. }
+        ));
+        assert!(!checkout.exists());
+
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]

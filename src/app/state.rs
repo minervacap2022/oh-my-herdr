@@ -25,6 +25,13 @@ pub(crate) struct PopupPaneState {
     pub height: Option<crate::popup_size::PopupSize>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingTerminalShutdown {
+    pub(crate) terminal_id: crate::terminal::TerminalId,
+    pub(crate) released_roster_instance_id: Option<String>,
+    pub(crate) released_agent_name: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Selection autoscroll types
 // ---------------------------------------------------------------------------
@@ -1088,6 +1095,7 @@ pub enum SettingsSection {
     Sound,
     Toast,
     PaneLabels,
+    Agents,
     Integrations,
 }
 
@@ -1098,6 +1106,7 @@ impl SettingsSection {
         Self::Sound,
         Self::Toast,
         Self::PaneLabels,
+        Self::Agents,
         Self::Integrations,
     ];
 
@@ -1108,6 +1117,7 @@ impl SettingsSection {
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Agents => "agents",
             Self::Integrations => "integrations",
         }
     }
@@ -1187,6 +1197,36 @@ pub struct SettingsState {
     pub original_palette: Option<Palette>,
     /// The theme name before opening settings.
     pub original_theme: Option<String>,
+    /// A profile being created or edited in Settings > Agents. Keeping the
+    /// draft in presentation state leaves the registry as the single durable
+    /// source of truth until the user saves.
+    pub agent_profile_form: Option<AgentProfileForm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProfileForm {
+    /// Existing roles are immutable because they are the durable profile and
+    /// roster identity. `None` represents a new profile.
+    pub existing_role: Option<String>,
+    pub role: String,
+    pub harness: String,
+    pub native_cwd: String,
+    pub instructions: String,
+    pub selected_field: usize,
+}
+
+impl AgentProfileForm {
+    pub fn is_new(&self) -> bool {
+        self.existing_role.is_none()
+    }
+
+    pub fn field_count(&self) -> usize {
+        if self.is_new() {
+            4
+        } else {
+            2
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1277,6 +1317,10 @@ pub enum ContextMenuKind {
         has_manual_label: bool,
         right_click_passthrough: bool,
     },
+    AgentProfileSpawn {
+        role: String,
+        ws_idx: usize,
+    },
 }
 
 /// Right-click context menu state.
@@ -1326,7 +1370,7 @@ impl ContextMenuState {
                 if source_pane_id.is_some() {
                     items.push("Swap with focused pane");
                 }
-                items.extend(["Split right", "Split down", "Zoom"]);
+                items.push("Zoom");
                 items.push(if right_click_passthrough {
                     "Use Herdr right-click menu"
                 } else {
@@ -1334,6 +1378,9 @@ impl ContextMenuState {
                 });
                 items.push("Close pane");
                 items
+            }
+            ContextMenuKind::AgentProfileSpawn { .. } => {
+                vec!["Use space cwd", "Use agent native cwd"]
             }
         }
     }
@@ -1425,6 +1472,17 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// Client-facing projection of a persistent agent profile. The registry owns
+/// the durable record; AppState keeps only the data needed to render and hit
+/// test the Agents sidebar without coupling rendering to persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedAgentProfile {
+    pub role: String,
+    pub native_cwd: String,
+    pub harness: String,
+    pub replicas_assigned: u32,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1443,6 +1501,7 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
+    pub saved_agent_profiles: Vec<SavedAgentProfile>,
     pub selected: usize,
     pub mode: Mode,
     /// Stable workspace identity captured when the close confirmation opens.
@@ -1472,6 +1531,9 @@ pub struct AppState {
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
+    pub workspace_create_cwd_input: String,
+    pub workspace_create_cwd_editing: bool,
+    pub workspace_create_cwd_replace_on_type: bool,
     pub rename_pane_target: Option<PaneId>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
@@ -1611,6 +1673,8 @@ pub struct AppState {
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
+    pub(crate) plugin_command_root_leases: std::collections::HashMap<std::path::PathBuf, usize>,
+    pub(crate) plugin_command_lease_roots: std::collections::HashMap<String, std::path::PathBuf>,
     /// Highlight state for the bottom-right global launcher menu.
     pub global_menu: MenuListState,
     /// Resolved host terminal default colors for theming embedded panes.
@@ -1623,7 +1687,7 @@ pub struct AppState {
     pub session_dirty: bool,
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
-    pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    pub(crate) terminal_runtime_shutdowns: Vec<PendingTerminalShutdown>,
 }
 
 impl AppState {
@@ -1836,6 +1900,7 @@ impl AppState {
             workspaces: Vec::new(),
             active: None,
             previous_pane_focus: None,
+            saved_agent_profiles: Vec::new(),
             selected: 0,
             mode: Mode::Navigate,
             confirm_close_workspace_id: None,
@@ -1857,6 +1922,9 @@ impl AppState {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            workspace_create_cwd_input: String::new(),
+            workspace_create_cwd_editing: false,
+            workspace_create_cwd_replace_on_type: false,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -1983,6 +2051,7 @@ impl AppState {
                 list: SelectionListState::new(0),
                 original_palette: None,
                 original_theme: None,
+                agent_profile_form: None,
             },
             integration_recommendations: Vec::new(),
             agent_manifest_summaries: Vec::new(),
@@ -1995,6 +2064,8 @@ impl AppState {
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
+            plugin_command_root_leases: std::collections::HashMap::new(),
+            plugin_command_lease_roots: std::collections::HashMap::new(),
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
@@ -2330,6 +2401,9 @@ impl AppState {
                     if let Some(source_pane_id) = source_pane_id {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
+                }
+                ContextMenuKind::AgentProfileSpawn { ws_idx, .. } => {
+                    assert_workspace_index(ws_idx, "context menu agent profile workspace");
                 }
             }
         }

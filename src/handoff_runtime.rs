@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct HandoffRuntimeState {
     pub pane_id: u32,
     pub child_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<u32>,
     pub rows: u16,
     pub cols: u16,
     pub cell_width_px: u32,
@@ -27,6 +29,14 @@ pub(crate) struct HandoffRuntimeState {
     pub terminal_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_history_ansi: Option<String>,
+    #[serde(default)]
+    pub has_received_input: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_input_age_ms: Option<u64>,
+    /// Wall-clock timestamp when `last_input_age_ms` was captured. This lets
+    /// the importing server include transfer time in the recent-input guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_timing_captured_at_ms: Option<u64>,
 }
 
 #[cfg(unix)]

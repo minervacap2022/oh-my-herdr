@@ -32,9 +32,10 @@ pub(crate) fn init_file_logging(file_name: &str) {
 
 pub(crate) fn help_log_paths_summary() -> String {
     let dir = crate::session::data_dir();
+    let product = crate::config::product_name();
     format!(
-        "{} (plus herdr-client.log, herdr-server.log)",
-        dir.join("herdr.log").display()
+        "{} (plus {product}-client.log, {product}-server.log)",
+        dir.join(format!("{product}.log")).display()
     )
 }
 

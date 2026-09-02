@@ -10,14 +10,14 @@ use crate::api::schema::{
 
 macro_rules! print {
     ($($arg:tt)*) => {{
-        crate::platform::begin_cli_output();
+        let _cli_output = crate::platform::cli_output_guard();
         std::print!($($arg)*);
     }};
 }
 
 macro_rules! println {
     ($($arg:tt)*) => {{
-        crate::platform::begin_cli_output();
+        let _cli_output = crate::platform::cli_output_guard();
         std::println!($($arg)*);
     }};
 }
@@ -208,7 +208,6 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         ChannelSetInstallAction::RunSelfUpdate => {}
     }
 
-    crate::platform::end_cli_output();
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
         eprintln!("Run `herdr update` to retry.");

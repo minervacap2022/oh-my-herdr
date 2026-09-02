@@ -148,6 +148,24 @@ pub(crate) fn interactive_shell_command(_argv: &[String], _shell_name: &str) -> 
     None
 }
 
+pub(crate) fn interactive_shell_command_in_cwd(
+    _argv: &[String],
+    _shell_name: &str,
+    _cwd: &std::path::Path,
+) -> Option<String> {
+    None
+}
+
+pub(crate) fn interactive_shell_command_with_env_in_cwd(
+    _argv: &[String],
+    _shell_name: &str,
+    _cwd: &std::path::Path,
+    _target_env: &str,
+    _source_env: &str,
+) -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub(crate) fn scrollback_editor_argv(_path: &std::path::Path) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(
@@ -189,7 +207,12 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
 }
 
 /// Unsupported platform stub.
-pub fn session_processes(_child_pid: u32) -> Vec<u32> {
+pub fn process_session_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Unsupported platform stub.
+pub fn session_processes(_session_id: u32) -> Vec<u32> {
     Vec::new()
 }
 

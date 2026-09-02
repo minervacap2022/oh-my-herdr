@@ -443,6 +443,44 @@ impl App {
         self.runtime_workspace_focus("tui.workspace.focus", workspace_id);
     }
 
+    pub(crate) fn spawn_agent_profile_via_api(&mut self, role: String) {
+        self.spawn_agent_profile_in_workspace_via_api(role, None, "tab");
+    }
+
+    pub(crate) fn spawn_agent_profile_in_workspace_via_api(
+        &mut self,
+        role: String,
+        ws_idx: Option<usize>,
+        cwd_mode: &str,
+    ) {
+        let tab_id = ws_idx.and_then(|idx| {
+            self.state
+                .workspaces
+                .get(idx)
+                .and_then(|ws| self.public_tab_id(idx, ws.active_tab))
+        });
+        let response = self.dispatch_runtime_mutation(
+            "tui.agent.profile.spawn",
+            crate::api::schema::Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+                role,
+                kind: None,
+                tab_id,
+                cwd_mode: cwd_mode.to_string(),
+                timeout_ms: None,
+                args: Vec::new(),
+            }),
+        );
+        if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response) {
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::NeedsAttention,
+                title: "agent profile failed".to_string(),
+                context: error.error.message,
+                position: None,
+                target: None,
+            });
+        }
+    }
+
     pub(crate) fn close_workspace_idx_with_group_via_api(&mut self, ws_idx: usize) {
         let workspace_id = self.public_workspace_id(ws_idx);
         self.runtime_workspace_close_group("tui.workspace.close", workspace_id);
@@ -2226,10 +2264,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_workspace_key_opens_prefilled_prompt_and_preserves_captured_cwd() {
+    async fn new_workspace_key_opens_prompt_with_home_cwd_default() {
         let cwd = unique_temp_path("workspace-name-suggestion");
         std::fs::create_dir_all(&cwd).unwrap();
-        let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
+        let default_cwd = crate::worktree::expand_tilde_path("~");
+        let suggested_name = crate::workspace::derive_label_from_cwd(&default_cwd);
         let mut app = app_with_test_workspaces(&["test"]);
         app.state.new_terminal_cwd =
             crate::config::NewTerminalCwdConfig::Path(cwd.display().to_string());
@@ -2242,7 +2281,11 @@ mod tests {
         assert_eq!(app.state.mode, Mode::RenameWorkspace);
         assert_eq!(app.state.name_input, suggested_name);
         assert!(app.state.name_input_replace_on_type);
-        assert_eq!(app.state.pending_workspace_create_cwd.as_ref(), Some(&cwd));
+        assert_eq!(
+            app.state.pending_workspace_create_cwd.as_ref(),
+            Some(&default_cwd)
+        );
+        assert_eq!(app.state.workspace_create_cwd_input, "~");
         assert_eq!(app.state.workspaces.len(), 1);
 
         app.state.new_terminal_cwd =
@@ -2250,7 +2293,7 @@ mod tests {
         app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 2);
-        assert_eq!(app.state.workspaces[1].identity_cwd, cwd);
+        assert_eq!(app.state.workspaces[1].identity_cwd, default_cwd);
         assert!(app.state.workspaces[1].custom_name.is_none());
         assert!(app.state.pending_workspace_create_cwd.is_none());
         assert_eq!(app.state.mode, Mode::Terminal);
@@ -2263,13 +2306,13 @@ mod tests {
         let cwd = unique_temp_path("workspace-custom-name");
         std::fs::create_dir_all(&cwd).unwrap();
         let mut app = app_with_test_workspaces(&["test"]);
-        app.state.new_terminal_cwd =
-            crate::config::NewTerminalCwdConfig::Path(cwd.display().to_string());
         app.state.prompt_new_workspace_name = true;
         app.state.mode = Mode::Navigate;
 
         app.execute_tui_navigate_action(NavigateAction::NewWorkspace, ActionContext::Navigate);
         app.state.name_input = "  logs  ".into();
+        app.state.workspace_create_cwd_editing = true;
+        app.state.workspace_create_cwd_input = cwd.display().to_string();
         app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 2);

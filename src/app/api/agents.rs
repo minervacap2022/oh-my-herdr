@@ -1,10 +1,12 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentBroadcastParams, AgentProfileCreateParams, AgentProfileSetMdParams, AgentPromptParams,
+    AgentRenameParams, AgentReviveParams, AgentRosterEntryInfo, AgentRosterStatus,
+    AgentSendKeysParams, AgentSpawnParams, AgentStartParams, AgentTarget, PaneReadResult,
+    ResponseResult,
 };
 use crate::app::App;
 
@@ -59,6 +61,223 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
+    pub(super) fn handle_agent_spawn(&mut self, id: String, params: AgentSpawnParams) -> String {
+        match self.spawn_agent(params) {
+            Ok(crate::app::agents::AgentSpawnOutcome::Spawned(spawned)) => {
+                encode_success(id, ResponseResult::AgentSpawned { spawned: *spawned })
+            }
+            Ok(crate::app::agents::AgentSpawnOutcome::Pending(pending)) => {
+                let pane_id = pending.pane_id().to_string();
+                self.cancel_pending_agent_spawn(*pending);
+                encode_error(
+                    id,
+                    "agent_spawn_failed",
+                    format!("agent pane {pane_id} busy"),
+                )
+            }
+            Err(err) => encode_error_body(id, self.agent_spawn_error_body(err)),
+        }
+    }
+
+    pub(super) fn handle_agent_roster_list(&mut self, id: String) -> String {
+        if let Err(err) = self.refresh_agent_registry_for_read() {
+            return encode_error_body(
+                id,
+                self.agent_profile_error_body(crate::app::agents::AgentProfileError::LoadFailed(
+                    err.to_string(),
+                )),
+            );
+        }
+        let entries = self
+            .agent_registry
+            .roster
+            .values()
+            .cloned()
+            .map(|entry| AgentRosterEntryInfo {
+                instance_id: entry.instance_id,
+                profile_id: entry.profile_id,
+                role: entry.role,
+                replica_suffix: entry.replica_suffix,
+                display_name: entry.display_name,
+                status: match entry.status {
+                    crate::agent_registry::AgentStatus::Active => AgentRosterStatus::Active,
+                    crate::agent_registry::AgentStatus::Idle => AgentRosterStatus::Idle,
+                    crate::agent_registry::AgentStatus::Working => AgentRosterStatus::Working,
+                    crate::agent_registry::AgentStatus::Blocked => AgentRosterStatus::Blocked,
+                    crate::agent_registry::AgentStatus::Done => AgentRosterStatus::Done,
+                    crate::agent_registry::AgentStatus::Unknown => AgentRosterStatus::Unknown,
+                    crate::agent_registry::AgentStatus::Terminated => AgentRosterStatus::Terminated,
+                },
+                last_pane: entry.last_pane,
+                last_seen_at: entry.last_seen_at,
+            })
+            .collect();
+        encode_success(id, ResponseResult::AgentRosterList { entries })
+    }
+
+    pub(super) fn handle_agent_revive(&mut self, id: String, params: AgentReviveParams) -> String {
+        match self.revive_agent(
+            params.instance_id,
+            params.tab_id,
+            params.cwd_mode,
+            params.timeout_ms,
+            params.args,
+        ) {
+            Ok(crate::app::agents::AgentSpawnOutcome::Spawned(revived)) => {
+                encode_success(id, ResponseResult::AgentRevived { revived: *revived })
+            }
+            Ok(crate::app::agents::AgentSpawnOutcome::Pending(pending)) => {
+                let pane_id = pending.pane_id().to_string();
+                self.cancel_pending_agent_spawn(*pending);
+                encode_error(
+                    id,
+                    "agent_revive_failed",
+                    format!("agent pane {pane_id} busy"),
+                )
+            }
+            Err(err) => encode_error_body(id, self.agent_spawn_error_body(err)),
+        }
+    }
+
+    pub(crate) fn handle_deferred_agent_spawn_api_request(
+        &mut self,
+        id: String,
+        params: AgentSpawnParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) -> bool {
+        match self.spawn_agent(params) {
+            Ok(crate::app::agents::AgentSpawnOutcome::Spawned(spawned)) => {
+                let _ = respond_to.send(encode_success(
+                    id,
+                    ResponseResult::AgentSpawned { spawned: *spawned },
+                ));
+            }
+            Ok(crate::app::agents::AgentSpawnOutcome::Pending(pending)) => {
+                self.pending_agent_spawns
+                    .push(crate::app::agents::DeferredAgentSpawn {
+                        id,
+                        respond_to,
+                        pending: *pending,
+                        revived: false,
+                    });
+                self.sync_pending_agent_spawn_deadline();
+            }
+            Err(err) => {
+                let _ = respond_to.send(encode_error_body(id, self.agent_spawn_error_body(err)));
+            }
+        }
+        true
+    }
+
+    pub(crate) fn handle_deferred_agent_revive_api_request(
+        &mut self,
+        id: String,
+        params: AgentReviveParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) -> bool {
+        match self.revive_agent(
+            params.instance_id,
+            params.tab_id,
+            params.cwd_mode,
+            params.timeout_ms,
+            params.args,
+        ) {
+            Ok(crate::app::agents::AgentSpawnOutcome::Spawned(revived)) => {
+                let _ = respond_to.send(encode_success(
+                    id,
+                    ResponseResult::AgentRevived { revived: *revived },
+                ));
+            }
+            Ok(crate::app::agents::AgentSpawnOutcome::Pending(pending)) => {
+                self.pending_agent_spawns
+                    .push(crate::app::agents::DeferredAgentSpawn {
+                        id,
+                        respond_to,
+                        pending: *pending,
+                        revived: true,
+                    });
+                self.sync_pending_agent_spawn_deadline();
+            }
+            Err(err) => {
+                let _ = respond_to.send(encode_error_body(id, self.agent_spawn_error_body(err)));
+            }
+        }
+        true
+    }
+
+    pub(crate) fn complete_due_agent_spawns(&mut self, now: Instant) -> bool {
+        let completions = self.poll_pending_agent_spawns(now);
+        if completions.is_empty() {
+            return false;
+        }
+
+        for completion in completions {
+            let response = match completion.result {
+                Ok(spawned) if completion.revived => encode_success(
+                    completion.id,
+                    ResponseResult::AgentRevived { revived: spawned },
+                ),
+                Ok(spawned) => {
+                    encode_success(completion.id, ResponseResult::AgentSpawned { spawned })
+                }
+                Err(err) => encode_error_body(completion.id, self.agent_spawn_error_body(err)),
+            };
+            let _ = completion.respond_to.send(response);
+        }
+        true
+    }
+
+    pub(super) fn handle_agent_profile_set_md(
+        &mut self,
+        id: String,
+        params: AgentProfileSetMdParams,
+    ) -> String {
+        match self.set_profile_md(&params.role, &params.name, params.path.as_deref()) {
+            Ok(profile) => encode_success(id, ResponseResult::AgentProfileInfoSet { profile }),
+            Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
+        }
+    }
+
+    pub(super) fn handle_agent_profile_create(
+        &mut self,
+        id: String,
+        params: AgentProfileCreateParams,
+    ) -> String {
+        match self.create_profile(params) {
+            Ok(profile) => encode_success(id, ResponseResult::AgentProfileInfo { profile }),
+            Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
+        }
+    }
+
+    pub(super) fn handle_agent_profile_get(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentProfileGetParams,
+    ) -> String {
+        match self.profile(&params.role) {
+            Ok(profile) => encode_success(id, ResponseResult::AgentProfileInfo { profile }),
+            Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
+        }
+    }
+
+    pub(super) fn handle_agent_profile_list(&mut self, id: String) -> String {
+        match self.profiles() {
+            Ok(profiles) => encode_success(id, ResponseResult::AgentProfileList { profiles }),
+            Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
+        }
+    }
+
+    pub(super) fn handle_agent_profile_set(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentProfileSetParams,
+    ) -> String {
+        match self.set_profile(params) {
+            Ok(profile) => encode_success(id, ResponseResult::AgentProfileInfo { profile }),
+            Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
+        }
+    }
+
     pub(super) fn handle_agent_prompt(&mut self, id: String, params: AgentPromptParams) -> String {
         if params.text.is_empty() {
             return encode_error(id, "empty_agent_prompt", "agent prompt must not be empty");
@@ -67,6 +286,50 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        match self.send_agent_prompt(&resolved, &params.target, &params.text) {
+            Ok(agent) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    pub(super) fn handle_agent_broadcast(
+        &mut self,
+        id: String,
+        params: AgentBroadcastParams,
+    ) -> String {
+        if params.text.is_empty() {
+            return encode_error(id, "empty_agent_prompt", "agent prompt must not be empty");
+        }
+        let targets = self.agent_targets_for_role(&params.role);
+        if targets.is_empty() {
+            return agent_not_found(id, &params.role);
+        }
+
+        // Validate all destinations before submitting to any of them. A role
+        // broadcast must never silently skip a blocked or stale replica.
+        for target in &targets {
+            if let Err(error) = self.prepare_agent_prompt(target, &params.role) {
+                return encode_error_body(id, error);
+            }
+        }
+        let agents = targets
+            .iter()
+            .map(|target| self.send_agent_prompt(target, &params.role, &params.text))
+            .collect::<Result<Vec<_>, _>>();
+        match agents {
+            Ok(agents) => encode_success(id, ResponseResult::AgentBroadcast { agents }),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    fn prepare_agent_prompt(
+        &self,
+        resolved: &crate::app::terminal_targets::TerminalTarget,
+        target: &str,
+    ) -> Result<
+        (&crate::terminal::TerminalRuntime, crate::detect::Agent),
+        crate::api::schema::ErrorBody,
+    > {
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -74,60 +337,94 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
             .cloned()
         else {
-            return agent_not_found(id, &params.target);
+            return Err(self.agent_target_error_body(
+                crate::app::terminal_targets::TerminalTargetError::NotFound {
+                    target: target.to_string(),
+                },
+            ));
         };
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
-            return agent_not_found(id, &params.target);
+            return Err(self.agent_target_error_body(
+                crate::app::terminal_targets::TerminalTargetError::NotFound {
+                    target: target.to_string(),
+                },
+            ));
         };
         if terminal.state == crate::detect::AgentState::Blocked {
-            return encode_error(
-                id,
-                "agent_blocked",
-                format!(
-                    "agent {} is blocked and requires interactive input",
-                    params.target
-                ),
-            );
+            return Err(crate::api::schema::ErrorBody {
+                code: "agent_blocked".into(),
+                message: format!("agent {target} is blocked and requires interactive input"),
+            });
         }
         let Some(expected_agent) = terminal.effective_known_agent() else {
-            return agent_not_ready(id, &params.target);
+            return Err(crate::api::schema::ErrorBody {
+                code: "agent_not_ready".into(),
+                message: format!("agent {target} is not ready for prompts"),
+            });
         };
         if terminal.managed_agent_launch_pending() {
-            return agent_not_ready(id, &params.target);
+            return Err(crate::api::schema::ErrorBody {
+                code: "agent_not_ready".into(),
+                message: format!("agent {target} is not ready for prompts"),
+            });
         }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
+            return Err(self.agent_target_error_body(
+                crate::app::terminal_targets::TerminalTargetError::NotFound {
+                    target: target.to_string(),
+                },
+            ));
         };
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return encode_error(
-                id,
-                "agent_not_ready",
-                format!(
-                    "agent {} is no longer the pane foreground process",
-                    params.target
-                ),
-            );
+            return Err(crate::api::schema::ErrorBody {
+                code: "agent_not_ready".into(),
+                message: format!("agent {target} is no longer the pane foreground process"),
+            });
         }
+        Ok((runtime, expected_agent))
+    }
+
+    fn send_agent_prompt(
+        &self,
+        resolved: &crate::app::terminal_targets::TerminalTarget,
+        target: &str,
+        prompt: &str,
+    ) -> Result<crate::api::schema::AgentInfo, crate::api::schema::ErrorBody> {
+        let (runtime, expected_agent) = self.prepare_agent_prompt(resolved, target)?;
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(focus) => focus,
-                Err(err) => return encode_error(id, "agent_prompt_failed", err.to_string()),
+                Err(err) => {
+                    return Err(crate::api::schema::ErrorBody {
+                        code: "agent_prompt_failed".into(),
+                        message: err.to_string(),
+                    })
+                }
             };
             if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
-                return encode_error(id, "agent_prompt_failed", err.to_string());
+                return Err(crate::api::schema::ErrorBody {
+                    code: "agent_prompt_failed".into(),
+                    message: err.to_string(),
+                });
             }
         }
-        let (text, enter) =
-            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
+        let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, prompt);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
-            return encode_error(id, "agent_prompt_failed", err.to_string());
+            return Err(crate::api::schema::ErrorBody {
+                code: "agent_prompt_failed".into(),
+                message: err.to_string(),
+            });
         }
         runtime.send_bytes_after(Bytes::from(enter), AGENT_PROMPT_SUBMIT_DELAY);
-        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
-        };
-        encode_success(id, ResponseResult::AgentPrompted { agent })
+        self.agent_info(resolved.ws_idx, resolved.pane_id)
+            .ok_or_else(|| {
+                self.agent_target_error_body(
+                    crate::app::terminal_targets::TerminalTargetError::NotFound {
+                        target: target.to_string(),
+                    },
+                )
+            })
     }
 
     pub(super) fn handle_agent_read(
@@ -417,6 +714,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_broadcast_reaches_every_replica_and_role_pane_selects_one() {
+        let mut app = app_with_agent();
+        let first_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let second_pane =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+
+        let mut receivers = Vec::new();
+        for (pane_id, name, suffix) in [
+            (first_pane, "reviewer", ""),
+            (second_pane, "reviewer-replica-1", "-replica-1"),
+        ] {
+            let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.into());
+            terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+            let (runtime, receiver) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80, 24, 0, b"", 2,
+                );
+            runtime.test_process_pty_bytes(b"\x1b[?2004h");
+            app.state.insert_test_runtime(pane_id, runtime);
+            let pane = app.public_pane_id(0, pane_id).unwrap();
+            app.agent_registry
+                .register_or_get("reviewer", std::path::PathBuf::from("/tmp"));
+            app.agent_registry
+                .roster_register(name, "reviewer", "reviewer", suffix, Some(pane));
+            receivers.push(receiver);
+        }
+
+        let response = app.handle_agent_broadcast(
+            "broadcast".into(),
+            AgentBroadcastParams {
+                role: "reviewer".into(),
+                text: "check this".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentBroadcast { agents } = success.result else {
+            panic!("expected broadcast response");
+        };
+        assert_eq!(agents.len(), 2);
+        for receiver in &mut receivers {
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Bytes::from_static(b"\x1b[200~check this\x1b[201~")
+            );
+        }
+
+        let ambiguous = app.handle_agent_prompt(
+            "ambiguous".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "one only".into(),
+                wait: None,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&ambiguous).unwrap();
+        assert_eq!(error.error.code, "agent_target_ambiguous");
+
+        let second_pane_id = app.public_pane_id(0, second_pane).unwrap();
+        let selected = app.handle_agent_prompt(
+            "selected".into(),
+            AgentPromptParams {
+                target: format!("reviewer@{second_pane_id}"),
+                text: "one only".into(),
+                wait: None,
+            },
+        );
+        let selected: SuccessResponse = serde_json::from_str(&selected).unwrap();
+        assert!(matches!(
+            selected.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            receivers[1].try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~one only\x1b[201~")
+        );
+    }
+
+    #[tokio::test]
     async fn agent_prompt_rejects_blocked_agent_without_writing() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -544,6 +922,7 @@ mod tests {
         terminal.begin_managed_agent(
             "reviewer".into(),
             Agent::OpenCode,
+            None,
             now,
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(10),

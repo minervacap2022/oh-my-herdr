@@ -962,9 +962,9 @@ impl App {
     }
 
     pub(crate) fn should_shutdown_workspace_terminal_runtimes_for_worktree_remove(
-        force: bool,
+        _force: bool,
     ) -> bool {
-        force || cfg!(windows)
+        cfg!(windows)
     }
 
     pub(crate) fn close_removed_linked_worktree_workspace(&mut self, ws_idx: usize) {
@@ -2391,6 +2391,9 @@ mod tests {
             App::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(false),
             cfg!(windows)
         );
-        assert!(App::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(true));
+        assert_eq!(
+            App::should_shutdown_workspace_terminal_runtimes_for_worktree_remove(true),
+            cfg!(windows)
+        );
     }
 }

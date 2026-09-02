@@ -289,6 +289,10 @@ fn plugin_uninstall(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    if let Some(plugin) = existing.as_ref() {
+        remove_managed_plugin_files(plugin)?;
+    }
+
     match super::send_request(&Request {
         id: "cli:plugin".into(),
         method: Method::PluginUnlink(PluginUnlinkParams {
@@ -318,9 +322,6 @@ fn plugin_uninstall(args: &[String]) -> std::io::Result<i32> {
         Err(err) => return Err(err),
     }
 
-    if let Some(plugin) = existing.as_ref() {
-        remove_managed_plugin_files(plugin)?;
-    }
     println!("Uninstalled {plugin_id}.");
     Ok(0)
 }

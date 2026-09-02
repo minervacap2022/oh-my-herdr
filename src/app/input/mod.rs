@@ -257,6 +257,9 @@ impl App {
                     .extend(text.chars().filter(|ch| !ch.is_control()));
                 true
             }
+            Mode::Settings if self.state.settings.agent_profile_form.is_some() => {
+                settings::insert_agent_profile_form_text(&mut self.state, text)
+            }
             _ => false,
         }
     }
@@ -400,6 +403,7 @@ impl App {
                     MouseAction::NewWorkspace => {
                         self.begin_tui_workspace_create("tui.mouse.workspace.create")
                     }
+                    MouseAction::NewAgentProfile => self.open_sidebar_agent_profile_create_form(),
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),
                         SettingsAction::SaveStatusIndicators(style) => {
@@ -414,6 +418,16 @@ impl App {
                         }
                         SettingsAction::InstallRecommendedIntegrations => {
                             self.install_recommended_integrations()
+                        }
+                        SettingsAction::OpenAgentCreate(harness) => {
+                            self.open_agent_profile_create_form(harness)
+                        }
+                        SettingsAction::OpenAgentEdit(role) => {
+                            self.open_agent_profile_edit_form(role)
+                        }
+                        SettingsAction::SaveAgentProfile => self.save_agent_profile_form(),
+                        SettingsAction::StartAgentProfile(role) => {
+                            self.spawn_agent_profile_via_api(role)
                         }
                     },
                     MouseAction::FocusWorkspace { ws_idx } => {
@@ -746,6 +760,7 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
             .copy_mode
             .as_ref()
             .is_some_and(|copy_mode| copy_mode.search.prompt.is_some()),
+        Mode::Settings => state.settings.agent_profile_form.is_some(),
         _ => false,
     }
 }
