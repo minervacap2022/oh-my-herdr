@@ -1,84 +1,99 @@
-# herdr
-
+# OhMyHerdr
 
 <p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
+  <img src="assets/logo.png" alt="OhMyHerdr" width="100" />
 </p>
 
 <p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
+  Native agent profiles, persistent agent instructions, and shared coding spaces.
 </p>
 
 <p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
+  <a href="#install">install</a> · <a href="#native-agent-profiles">agent profiles</a> · <a href="https://github.com/minervacap2022/oh-my-herdr/releases">releases</a>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
+  <a href="https://github.com/minervacap2022/oh-my-herdr/releases/latest"><img src="https://img.shields.io/github/v/release/minervacap2022/oh-my-herdr?label=release&labelColor=333333&color=666666" alt="latest release" /></a>
+  <a href="https://github.com/minervacap2022/oh-my-herdr/stargazers"><img src="https://img.shields.io/github/stars/minervacap2022/oh-my-herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
 </p>
 
 ---
 
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
+**One runtime for agent collaboration, with every agent's native identity kept
+intact.**
 
-**the runtime your coding agents live on.**
-
-- **always running** — herdr is a background server; the terminals live inside it. close the lid, drop the network, or restart the machine; agents keep working and sessions come back. reattach from any terminal, or over ssh.
-- **never hunt for the stuck one** — every pane is marked working, blocked, or idle. when an agent stops and needs an answer, herdr says so.
-- **agent-native** — agents drive herdr through the cli and socket api: they can spawn panes, prompt each other, and wait until another agent is genuinely blocked. [agent skill →](https://herdr.dev/docs/agent-skill/)
-- **runs what you already run** — claude code, codex, cursor, opencode, grok and the rest. herdr doesn't wrap or replace them; it owns their terminals.
-- **keyboard and mouse, both first-class** — tmux-style prefix keys *and* click, drag, split. pick per moment, not per tool.
-- **plugins** — extend panes and workflows. [browse the marketplace →](https://herdr.dev/plugins/)
-- **one rust binary, no electron** — runs in whatever terminal you already use.
-
----
+- **Native profiles** — save Codex, Pi, and Claude Code profiles with each
+  harness's settings, model choices, tool permissions, and native working
+  directory.
+- **An instruction document per profile** — every saved agent owns a durable,
+  editable `AGENTS.md`. Open a profile dossier to read and edit the complete
+  multiline document without losing its formatting.
+- **Spaces that coordinate without forcing one directory** — a Space has a
+  default working directory, but a spawned agent can use either the Space
+  directory or its own native directory. Its profile instructions persist in
+  both cases.
+- **A visual workflow** — create profiles from the Agents sidebar, inspect and
+  edit them in Settings, and spawn them into a Space without hardcoded roles or
+  duplicate profile rows.
+- **Separate product runtime** — OhMyHerdr uses its own binary, server,
+  sockets, configuration, sessions, and OTA manifest. It neither shares nor
+  interrupts a stable Herdr installation.
 
 ## install
 
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
-
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
-
-then start it where the work lives:
+The first production release supports Apple Silicon macOS. Install the product
+binary separately from any stable Herdr binary:
 
 ```bash
-herdr
+install_dir="${OHMYHERDR_INSTALL_DIR:-$HOME/.local/bin}"
+mkdir -p "$install_dir"
+curl -fsSL \
+  https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-macos-aarch64 \
+  -o "$install_dir/ohmyherdr"
+chmod +x "$install_dir/ohmyherdr"
 ```
 
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
+Ensure `$HOME/.local/bin` is on `PATH`, then start OhMyHerdr where the work
+lives:
 
-## docs
+```bash
+ohmyherdr
+```
 
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
+To install a later product release, run:
 
-## thanks
+```bash
+ohmyherdr update
+```
 
-every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
+The updater reads only OhMyHerdr's public release manifest and verifies the
+downloaded binary's SHA-256 before replacing the product executable.
 
-enterprise / partnership: hey@herdr.dev
+## native agent profiles
 
-## agent instructions
+1. In the **Agents** sidebar, select **new**.
+2. Choose Codex, Pi, or Claude Code and set the profile's native working
+   directory.
+3. Write the profile's `AGENTS.md` in its dossier. Enter adds a line;
+   Ctrl+Enter saves.
+4. Open a Space and choose whether the new pane starts in the Space directory
+   or the agent's native directory.
 
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
+Closing a replica frees its number for reuse. Deleting a profile removes its
+saved settings and owned instruction document; it does not delete live panes.
 
 ## development
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
+git clone https://github.com/minervacap2022/oh-my-herdr
+cd oh-my-herdr
 cargo build --release
 
-just test        # unit tests
-just check       # formatting, tests, and maintenance checks
+just test
+just check
 ```
 
 ## license
 
-Herdr is licensed under the [Apache License 2.0](LICENSE).
+OhMyHerdr is licensed under the [Apache License 2.0](LICENSE).

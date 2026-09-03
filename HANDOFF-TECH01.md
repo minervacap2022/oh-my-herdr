@@ -426,3 +426,27 @@ Publishing a Windows artifact before making its installer use an independent
 OhMyHerdr install path would risk writing to stable Herdr's install directory,
 which is prohibited. Linux and Intel macOS are likewise not advertised until
 their product-native installation paths are released and verified.
+
+### Publication result
+
+The public production release is now live:
+
+```text
+release URL  https://github.com/minervacap2022/oh-my-herdr/releases/tag/ohmyherdr-v0.8.3
+tag          ohmyherdr-v0.8.3
+target       e48325551b903382ab6760dc4fcf17b50794ddb4
+artifact     ohmyherdr-macos-aarch64
+SHA-256      11e8fcd289f679a7cb0bd9d8bb74716ccbc77d393f1aa4e072757f0c15f4ac5b
+manifest     https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-latest.json
+```
+
+The manifest was fetched anonymously from its native endpoint, parsed as JSON,
+and confirmed to advertise version `0.8.3`, protocol `21`, the pinned asset
+URL, and the same SHA-256. The artifact was separately downloaded anonymously;
+its checksum matched and it reported `ohmyherdr 0.8.3-ohmyherdr.0.8.3`.
+
+GitHub Actions remains disabled by the `minervacap2022` organization policy,
+so the checked-in manual release workflow cannot run until an organization
+administrator enables Actions. The first release was published directly from
+the verified local product build; native OTA is live despite that automation
+policy. The queued workflow run was never allowed to start.
