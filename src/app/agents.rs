@@ -2371,6 +2371,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn profile_markdown_injects_each_owned_document_for_claude() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-agent-spawn-profile-documents-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let agents = root.join("AGENTS.md");
+        let review = root.join("review.md");
+        std::fs::write(&agents, "base instructions").unwrap();
+        std::fs::write(&review, "review instructions").unwrap();
+
+        assert_eq!(
+            profile_md_args(
+                "claude",
+                &[
+                    crate::agent_registry::AgentMd {
+                        name: "AGENTS.md".into(),
+                        path: agents.clone(),
+                    },
+                    crate::agent_registry::AgentMd {
+                        name: "review.md".into(),
+                        path: review.clone(),
+                    },
+                ],
+            )
+            .unwrap(),
+            vec![
+                "--append-system-prompt-file".into(),
+                agents.display().to_string(),
+                "--append-system-prompt-file".into(),
+                review.display().to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn spawn_rejects_non_utf8_cwd_before_registry_or_layout_mutation() {

@@ -450,3 +450,41 @@ so the checked-in manual release workflow cannot run until an organization
 administrator enables Actions. The first release was published directly from
 the verified local product build; native OTA is live despite that automation
 policy. The queued workflow run was never allowed to start.
+
+## 2026-09-03 profile document cabinet
+
+The next OhMyHerdr product build is `0.8.4`. Each saved profile now owns a
+small editable document cabinet under its existing private state directory:
+
+```text
+/Users/tech01/.config/ohmyherdr/agent-context/<profile>/AGENTS.md
+/Users/tech01/.config/ohmyherdr/agent-context/<profile>/<user-name>.md
+```
+
+`Settings → Agents → e` opens directly on the real `AGENTS.md` contents and
+places the insertion point in that editor. It no longer displays the path as a
+substitute for the document. The document row lists `AGENTS.md` and each
+profile-owned extra file: `a` creates a named `.md`, left/right changes the
+active document, and `d` removes the selected extra document (never
+`AGENTS.md`). Ctrl+Enter saves the current profile settings and every edited
+profile document.
+
+Documents are not copied or symlinked into Spaces. They stay profile-owned and
+the profile spawn path injects every registered document for Codex, Pi, and
+Claude, regardless of whether the launch uses the Space CWD or the profile's
+native CWD. Existing externally attached Markdown remains visible as a linked
+attachment but is not rewritten by the profile document editor.
+
+Verification before publication:
+
+```text
+cargo test --bin herdr -- --test-threads=1
+3410 passed, 1 ignored
+
+product build identity  ohmyherdr 0.8.4-ohmyherdr.0.8.4
+product build SHA-256   f6f4516a23aac3142ff8e009730c10a86b48bba2712c54b3bf4ed137c96457fd
+```
+
+This change has not stopped, restarted, or modified stable Herdr. The stable
+binary and server values above remain the required guardrails when installing
+or testing this next product OTA.

@@ -429,6 +429,12 @@ impl App {
                         SettingsAction::DeleteAgentProfile(role) => {
                             self.delete_agent_profile_via_api(role)
                         }
+                        SettingsAction::CreateAgentProfileMarkdown { role, name } => {
+                            self.create_agent_profile_markdown(role, name)
+                        }
+                        SettingsAction::DeleteAgentProfileMarkdown { role, name } => {
+                            self.delete_agent_profile_markdown(role, name)
+                        }
                         SettingsAction::StartAgentProfile(role) => {
                             self.spawn_agent_profile_via_api(role)
                         }

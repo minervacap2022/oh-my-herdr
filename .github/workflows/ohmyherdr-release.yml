@@ -86,7 +86,7 @@ jobs:
           {
             "version": "${version}",
             "protocol": ${protocol},
-            "notes": "### Changed\\n- Native agent profiles now own their settings and AGENTS.md documents.\\n- Spaces can select their own working directory when spawning a profile.\\n- The OhMyHerdr updater is isolated from stable Herdr.",
+            "notes": "### Changed\\n- Native agent profiles now own editable AGENTS.md and named Markdown documents.\\n- Spaces can select their own working directory when spawning a profile.\\n- The OhMyHerdr updater is isolated from stable Herdr.",
             "assets": {
               "macos-aarch64": {
                 "url": "${url}",

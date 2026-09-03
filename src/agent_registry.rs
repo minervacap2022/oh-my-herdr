@@ -655,6 +655,70 @@ pub fn read_owned_instructions(role: &str) -> std::io::Result<String> {
     std::fs::read_to_string(owned_instructions_path(role))
 }
 
+fn validate_owned_markdown_name(name: &str) -> std::io::Result<()> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || name == PROFILE_INSTRUCTIONS_FILENAME
+        || !name.ends_with(".md")
+        || name.chars().any(char::is_control)
+        || path.file_name().and_then(|file_name| file_name.to_str()) != Some(name)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "profile Markdown names must be a single .md filename other than AGENTS.md",
+        ));
+    }
+    Ok(())
+}
+
+fn owned_markdown_path_at(registry: &Path, role: &str, name: &str) -> std::io::Result<PathBuf> {
+    validate_owned_markdown_name(name)?;
+    Ok(registry
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PROFILE_CONTEXT_DIRECTORY)
+        .join(role)
+        .join(name))
+}
+
+/// Return the durable path for an extra profile-owned Markdown document.
+pub fn owned_markdown_path(role: &str, name: &str) -> std::io::Result<PathBuf> {
+    let registry = registry_path();
+    let target = resolve_write_target(&registry).unwrap_or(registry);
+    owned_markdown_path_at(&target, role, name)
+}
+
+/// Whether an injected document is one that belongs to this profile's
+/// document cabinet rather than an external Markdown attachment.
+pub fn is_owned_markdown_path(role: &str, name: &str, path: &Path) -> bool {
+    owned_markdown_path(role, name).is_ok_and(|owned| owned == path)
+}
+
+/// Create an empty or prefilled profile-owned Markdown document. Registry
+/// callers add the returned path to the profile only after this succeeds.
+pub fn create_owned_markdown(role: &str, name: &str, content: &str) -> std::io::Result<PathBuf> {
+    let path = owned_markdown_path(role, name)?;
+    write_owned_instructions(&path, content)?;
+    Ok(path)
+}
+
+/// Read a profile-owned Markdown document other than `AGENTS.md`.
+pub fn read_owned_markdown(role: &str, name: &str) -> std::io::Result<String> {
+    std::fs::read_to_string(owned_markdown_path(role, name)?)
+}
+
+/// Atomically save a profile-owned Markdown document other than `AGENTS.md`.
+pub fn replace_owned_markdown(role: &str, name: &str, content: &str) -> std::io::Result<()> {
+    replace_owned_instructions_at_path(&owned_markdown_path(role, name)?, content)
+}
+
+/// Remove one profile-owned Markdown document. The profile's `AGENTS.md` and
+/// the containing profile directory are intentionally left in place.
+pub fn remove_owned_markdown(role: &str, name: &str) -> std::io::Result<()> {
+    let path = owned_markdown_path(role, name)?;
+    std::fs::remove_file(path)
+}
+
 /// Materialize a profile-owned instruction file without changing registry
 /// state. Callers that persist a profile should add this path as `AGENTS.md`.
 pub fn write_owned_instructions(path: &Path, instructions: &str) -> std::io::Result<()> {
@@ -1336,6 +1400,41 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "first line\nsecond line\n"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_profile_markdown_uses_a_named_file_next_to_agents_instructions() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-agent-profile-markdown-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let registry_path = root.join(REGISTRY_FILENAME);
+        let document = owned_markdown_path_at(&registry_path, "reviewer", "review.md").unwrap();
+
+        write_owned_instructions(&document, "Read the diff.\n").unwrap();
+        replace_owned_instructions_at_path(&document, "Review every changed file.\n").unwrap();
+
+        assert_eq!(
+            document,
+            root.join(PROFILE_CONTEXT_DIRECTORY)
+                .join("reviewer")
+                .join("review.md")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&document).unwrap(),
+            "Review every changed file.\n"
+        );
+        for invalid in [
+            "",
+            "AGENTS.md",
+            "notes.txt",
+            "../escape.md",
+            "nested/doc.md",
+        ] {
+            assert!(owned_markdown_path_at(&registry_path, "reviewer", invalid).is_err());
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

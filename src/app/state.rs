@@ -1204,6 +1204,17 @@ pub struct SettingsState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProfileMarkdown {
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    /// Byte offset at a UTF-8 boundary in `content`.
+    pub cursor: usize,
+    /// First logical content line shown in the editor viewport.
+    pub scroll: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProfileForm {
     /// Existing roles are immutable because they are the durable profile and
     /// roster identity. `None` represents a new profile.
@@ -1219,16 +1230,19 @@ pub struct AgentProfileForm {
     pub apikey_ref: String,
     /// Empty means no tool allowlist is configured. Non-empty values are JSON.
     pub allowlist: String,
-    /// Other Markdown files injected alongside the profile-owned `AGENTS.md`.
-    pub additional_markdown: Vec<String>,
-    /// The durable path is useful when a user needs to identify this profile's
-    /// owned instructions among project-level instruction files.
-    pub instructions_path: Option<String>,
+    /// Other profile-owned Markdown files injected alongside `AGENTS.md`.
+    pub additional_markdown: Vec<AgentProfileMarkdown>,
+    /// Existing Markdown attachments outside this profile's document cabinet.
+    pub linked_markdown: Vec<String>,
     pub instructions: String,
     /// Byte offset at a UTF-8 boundary in `instructions`.
     pub instructions_cursor: usize,
     /// First logical instruction line shown in the editor viewport.
     pub instructions_scroll: usize,
+    /// `None` selects `AGENTS.md`; an index selects an additional document.
+    pub selected_markdown: Option<usize>,
+    /// A filename being entered for a new profile-owned Markdown document.
+    pub pending_markdown_name: Option<String>,
     pub selected_field: usize,
 }
 
@@ -1241,20 +1255,86 @@ impl AgentProfileForm {
         if self.is_new() {
             4
         } else {
-            7
+            8
         }
+    }
+
+    pub fn documents_field(&self) -> Option<usize> {
+        (!self.is_new()).then_some(6)
     }
 
     pub fn instructions_field(&self) -> usize {
         if self.is_new() {
             3
         } else {
-            6
+            7
         }
     }
 
     pub fn instructions_selected(&self) -> bool {
         self.selected_field == self.instructions_field()
+    }
+
+    pub fn documents_selected(&self) -> bool {
+        self.documents_field() == Some(self.selected_field)
+    }
+
+    pub fn selected_markdown_index(&self) -> Option<usize> {
+        self.selected_markdown
+            .filter(|index| *index < self.additional_markdown.len())
+    }
+
+    pub fn active_document_name(&self) -> &str {
+        self.selected_markdown_index()
+            .map(|index| self.additional_markdown[index].name.as_str())
+            .unwrap_or("AGENTS.md")
+    }
+
+    pub fn active_document_content(&self) -> &str {
+        self.selected_markdown_index()
+            .map(|index| self.additional_markdown[index].content.as_str())
+            .unwrap_or(&self.instructions)
+    }
+
+    pub fn active_document_scroll(&self) -> usize {
+        self.selected_markdown_index()
+            .map(|index| self.additional_markdown[index].scroll)
+            .unwrap_or(self.instructions_scroll)
+    }
+
+    pub fn active_document_mut(&mut self) -> (&mut String, &mut usize, &mut usize) {
+        let selected = self.selected_markdown_index();
+        match selected {
+            Some(index) => {
+                let document = &mut self.additional_markdown[index];
+                (
+                    &mut document.content,
+                    &mut document.cursor,
+                    &mut document.scroll,
+                )
+            }
+            None => (
+                &mut self.instructions,
+                &mut self.instructions_cursor,
+                &mut self.instructions_scroll,
+            ),
+        }
+    }
+
+    pub fn cycle_document(&mut self, forward: bool) {
+        let len = self.additional_markdown.len();
+        if len == 0 {
+            self.selected_markdown = None;
+            return;
+        }
+        self.selected_markdown = match self.selected_markdown_index() {
+            None if forward => Some(0),
+            None => Some(len - 1),
+            Some(0) if !forward => None,
+            Some(index) if forward && index + 1 == len => None,
+            Some(index) if forward => Some(index + 1),
+            Some(index) => Some(index - 1),
+        };
     }
 }
 

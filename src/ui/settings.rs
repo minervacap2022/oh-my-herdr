@@ -212,6 +212,13 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
             .settings
             .agent_profile_form
             .as_ref()
+            .is_some_and(|form| form.pending_markdown_name.is_some())
+        {
+            " type .md filename  ↵ creates  esc cancels"
+        } else if app
+            .settings
+            .agent_profile_form
+            .as_ref()
             .is_some_and(crate::app::state::AgentProfileForm::instructions_selected)
         {
             " tab selects field  ↵ adds line  ctrl+↵ saves  pgup/pgdn views"
@@ -473,7 +480,7 @@ fn render_agent_profile_form(
     let description = if form.is_new() {
         "choose a role, working directory, and profile-owned AGENTS.md"
     } else {
-        "inspect and change the saved native settings and AGENTS.md"
+        "inspect and change saved native settings and profile documents"
     };
     let mut details = vec![
         Line::from(Span::styled(
@@ -544,17 +551,39 @@ fn render_agent_profile_form(
             form.selected_field == 5,
             p,
         ));
-        details.push(Line::from(Span::styled(
-            format!(
-                " extra Markdown: {}",
-                if form.additional_markdown.is_empty() {
-                    "none".to_string()
+        if let Some(name) = &form.pending_markdown_name {
+            details.push(agent_profile_form_line(
+                "new .md",
+                if name.is_empty() {
+                    "type a filename ending in .md"
                 } else {
-                    form.additional_markdown.join(", ")
-                }
-            ),
-            Style::default().fg(p.overlay1),
-        )));
+                    name
+                },
+                form.documents_selected(),
+                p,
+            ));
+        } else {
+            let documents = std::iter::once("AGENTS.md")
+                .chain(
+                    form.additional_markdown
+                        .iter()
+                        .map(|markdown| markdown.name.as_str()),
+                )
+                .collect::<Vec<_>>()
+                .join("  ");
+            details.push(agent_profile_form_line(
+                "documents",
+                &format!("{documents}  (a add • ←→ select • d delete)"),
+                form.documents_selected(),
+                p,
+            ));
+        }
+        if !form.linked_markdown.is_empty() {
+            details.push(Line::from(Span::styled(
+                format!(" linked Markdown: {}", form.linked_markdown.join(", ")),
+                Style::default().fg(p.overlay1),
+            )));
+        }
     }
 
     let details_height = details.len() as u16;
@@ -567,10 +596,7 @@ fn render_agent_profile_form(
     .areas::<4>(area);
     frame.render_widget(Paragraph::new(details), rows[0]);
 
-    let document_title = match &form.instructions_path {
-        Some(path) => format!(" AGENTS.md  {path}"),
-        None => " AGENTS.md".to_string(),
-    };
+    let document_title = format!(" {}", form.active_document_name());
     let document_style = if form.instructions_selected() {
         Style::default().fg(p.text).bg(p.surface0)
     } else {
@@ -581,15 +607,22 @@ fn render_agent_profile_form(
         rows[1],
     );
     frame.render_widget(
-        Paragraph::new(form.instructions.clone())
+        Paragraph::new(form.active_document_content())
             .style(document_style)
             .wrap(Wrap { trim: false })
-            .scroll((form.instructions_scroll.min(u16::MAX as usize) as u16, 0)),
+            .scroll((
+                form.active_document_scroll().min(u16::MAX as usize) as u16,
+                0,
+            )),
         rows[2],
     );
     frame.render_widget(
-        Paragraph::new(if form.instructions_selected() {
+        Paragraph::new(if form.pending_markdown_name.is_some() {
+            " enter creates document • esc cancels"
+        } else if form.instructions_selected() {
             " ←→ moves cursor • home/end line • enter line break • ctrl+enter saves"
+        } else if form.documents_selected() {
+            " a adds a document • ←→ selects • d deletes selected document"
         } else {
             " enter saves • esc cancels"
         })
@@ -677,7 +710,9 @@ mod tests {
 
     use super::render_settings_overlay;
     use crate::app::{
-        state::{AgentProfileForm, AppState, SavedAgentProfile, SettingsSection},
+        state::{
+            AgentProfileForm, AgentProfileMarkdown, AppState, SavedAgentProfile, SettingsSection,
+        },
         Mode,
     };
 
@@ -738,10 +773,12 @@ mod tests {
             apikey_ref: String::new(),
             allowlist: String::new(),
             additional_markdown: Vec::new(),
-            instructions_path: None,
+            linked_markdown: Vec::new(),
             instructions: "review this change".to_string(),
             instructions_cursor: "review this change".len(),
             instructions_scroll: 0,
+            selected_markdown: None,
+            pending_markdown_name: None,
             selected_field: 0,
         });
 
@@ -774,12 +811,20 @@ mod tests {
             effort: "high".to_string(),
             apikey_ref: "env:REVIEWER_API_KEY".to_string(),
             allowlist: r#"{"tools":["Read"]}"#.to_string(),
-            additional_markdown: vec!["review-guide.md (/workspace/review-guide.md)".to_string()],
-            instructions_path: Some("/state/agent-context/reviewer/AGENTS.md".to_string()),
+            additional_markdown: vec![AgentProfileMarkdown {
+                name: "review-guide.md".to_string(),
+                path: "/state/agent-context/reviewer/review-guide.md".to_string(),
+                content: "Read the diff before replying.".to_string(),
+                cursor: 0,
+                scroll: 0,
+            }],
+            linked_markdown: Vec::new(),
             instructions: "# Reviewer\n\nCheck every changed file.".to_string(),
             instructions_cursor: 0,
             instructions_scroll: 0,
-            selected_field: 6,
+            selected_markdown: None,
+            pending_markdown_name: None,
+            selected_field: 7,
         });
 
         let rendered = rendered_text(&app);
@@ -790,10 +835,22 @@ mod tests {
             "sonnet",
             "high",
             "env:REVIEWER_API_KEY",
-            "extra Markdown",
+            "documents",
+            "review-guide.md",
             "# Reviewer",
             "Check every changed file.",
         ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered:?}"
+            );
+        }
+
+        let form = app.settings.agent_profile_form.as_mut().unwrap();
+        form.selected_markdown = Some(0);
+        form.selected_field = form.instructions_field();
+        let rendered = rendered_text(&app);
+        for expected in ["review-guide.md", "Read the diff before replying."] {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?}: {rendered:?}"

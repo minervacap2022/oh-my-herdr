@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use crate::{
     api::schema::{AgentProfileCreateParams, AgentProfileSetParams},
     app::{
-        state::{AgentProfileForm, AppState, SettingsSection, THEME_NAMES},
+        state::{AgentProfileForm, AgentProfileMarkdown, AppState, SettingsSection, THEME_NAMES},
         App, Mode,
     },
     config::{StatusIndicatorStyle, ToastDelivery},
@@ -24,6 +24,8 @@ pub(super) enum SettingsAction {
     OpenAgentEdit(String),
     SaveAgentProfile,
     DeleteAgentProfile(String),
+    CreateAgentProfileMarkdown { role: String, name: String },
+    DeleteAgentProfileMarkdown { role: String, name: String },
     StartAgentProfile(String),
 }
 
@@ -48,6 +50,12 @@ impl App {
                 SettingsAction::OpenAgentEdit(role) => self.open_agent_profile_edit_form(role),
                 SettingsAction::SaveAgentProfile => self.save_agent_profile_form(),
                 SettingsAction::DeleteAgentProfile(role) => self.delete_agent_profile_via_api(role),
+                SettingsAction::CreateAgentProfileMarkdown { role, name } => {
+                    self.create_agent_profile_markdown(role, name)
+                }
+                SettingsAction::DeleteAgentProfileMarkdown { role, name } => {
+                    self.delete_agent_profile_markdown(role, name)
+                }
                 SettingsAction::StartAgentProfile(role) => self.spawn_agent_profile_via_api(role),
             }
         }
@@ -76,10 +84,12 @@ impl App {
             apikey_ref: String::new(),
             allowlist: String::new(),
             additional_markdown: Vec::new(),
-            instructions_path: None,
+            linked_markdown: Vec::new(),
             instructions: "# Agent instructions".to_string(),
             instructions_cursor: "# Agent instructions".len(),
             instructions_scroll: 0,
+            selected_markdown: None,
+            pending_markdown_name: None,
             selected_field: 0,
         });
     }
@@ -104,12 +114,41 @@ impl App {
                             return;
                         }
                     };
-                let additional_markdown = profile
-                    .mds
-                    .iter()
-                    .filter(|md| md.name != "AGENTS.md")
-                    .map(|md| format!("{} ({})", md.name, md.path))
-                    .collect();
+                let mut additional_markdown = Vec::new();
+                let mut linked_markdown = Vec::new();
+                for markdown in profile.mds.iter().filter(|md| md.name != "AGENTS.md") {
+                    if crate::agent_registry::is_owned_markdown_path(
+                        &profile.role,
+                        &markdown.name,
+                        std::path::Path::new(&markdown.path),
+                    ) {
+                        match crate::agent_registry::read_owned_markdown(
+                            &profile.role,
+                            &markdown.name,
+                        ) {
+                            Ok(content) => additional_markdown.push(AgentProfileMarkdown {
+                                name: markdown.name.clone(),
+                                path: markdown.path.clone(),
+                                cursor: content.len(),
+                                content,
+                                scroll: 0,
+                            }),
+                            Err(err) => {
+                                self.show_agent_profile_feedback(
+                                    crate::app::state::ToastKind::NeedsAttention,
+                                    "agent profile failed",
+                                    format!(
+                                        "could not read this profile's {}: {err}",
+                                        markdown.name
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        linked_markdown.push(markdown.name.clone());
+                    }
+                }
                 self.state.settings.agent_profile_form = Some(AgentProfileForm {
                     existing_role: Some(profile.role.clone()),
                     role: profile.role,
@@ -132,15 +171,13 @@ impl App {
                         .and_then(|allowlist| serde_json::to_string(allowlist).ok())
                         .unwrap_or_default(),
                     additional_markdown,
-                    instructions_path: Some(
-                        crate::agent_registry::owned_instructions_path(&role)
-                            .display()
-                            .to_string(),
-                    ),
+                    linked_markdown,
                     instructions_cursor: instructions.len(),
                     instructions_scroll: 0,
                     instructions,
-                    selected_field: 0,
+                    selected_markdown: None,
+                    pending_markdown_name: None,
+                    selected_field: 7,
                 });
             }
             Err(err) => self.show_agent_profile_feedback(
@@ -189,6 +226,102 @@ impl App {
                 );
             }
         }
+    }
+
+    pub(super) fn create_agent_profile_markdown(&mut self, role: String, name: String) {
+        if let Err(err) = self.profile(&role) {
+            self.show_agent_profile_feedback(
+                crate::app::state::ToastKind::NeedsAttention,
+                "agent profile failed",
+                self.agent_profile_error_body(err).message,
+            );
+            return;
+        }
+        let path = match crate::agent_registry::create_owned_markdown(&role, &name, "") {
+            Ok(path) => path,
+            Err(err) => {
+                self.show_agent_profile_feedback(
+                    crate::app::state::ToastKind::NeedsAttention,
+                    "agent profile failed",
+                    format!("could not create {name}: {err}"),
+                );
+                return;
+            }
+        };
+        let profile = match self.set_profile_md(&role, &name, path.to_str()) {
+            Ok(profile) => profile,
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                self.show_agent_profile_feedback(
+                    crate::app::state::ToastKind::NeedsAttention,
+                    "agent profile failed",
+                    self.agent_profile_error_body(err).message,
+                );
+                return;
+            }
+        };
+        let path = profile
+            .mds
+            .iter()
+            .find(|markdown| markdown.name == name)
+            .map(|markdown| markdown.path.clone())
+            .unwrap_or_else(|| path.display().to_string());
+        if let Some(form) = self.state.settings.agent_profile_form.as_mut() {
+            if form.existing_role.as_deref() == Some(role.as_str()) {
+                form.additional_markdown.push(AgentProfileMarkdown {
+                    name: name.clone(),
+                    path,
+                    content: String::new(),
+                    cursor: 0,
+                    scroll: 0,
+                });
+                form.additional_markdown
+                    .sort_by(|left, right| left.name.cmp(&right.name));
+                form.selected_markdown = form
+                    .additional_markdown
+                    .iter()
+                    .position(|markdown| markdown.name == name);
+                form.pending_markdown_name = None;
+                form.selected_field = form.instructions_field();
+            }
+        }
+        self.show_agent_profile_feedback(
+            crate::app::state::ToastKind::UpdateInstalled,
+            "profile document created",
+            name,
+        );
+    }
+
+    pub(super) fn delete_agent_profile_markdown(&mut self, role: String, name: String) {
+        if let Err(err) = self.set_profile_md(&role, &name, None) {
+            self.show_agent_profile_feedback(
+                crate::app::state::ToastKind::NeedsAttention,
+                "agent profile failed",
+                self.agent_profile_error_body(err).message,
+            );
+            return;
+        }
+        if let Err(err) = crate::agent_registry::remove_owned_markdown(&role, &name) {
+            self.show_agent_profile_feedback(
+                crate::app::state::ToastKind::NeedsAttention,
+                "agent profile failed",
+                format!("removed {name} from the profile but could not delete its file: {err}"),
+            );
+            return;
+        }
+        if let Some(form) = self.state.settings.agent_profile_form.as_mut() {
+            if form.existing_role.as_deref() == Some(role.as_str()) {
+                form.additional_markdown
+                    .retain(|markdown| markdown.name != name);
+                form.selected_markdown = None;
+                form.selected_field = form.documents_field().unwrap_or(0);
+            }
+        }
+        self.show_agent_profile_feedback(
+            crate::app::state::ToastKind::Finished,
+            "profile document deleted",
+            name,
+        );
     }
 
     fn show_agent_profile_feedback(
@@ -553,6 +686,27 @@ fn update_agent_profile_form(state: &mut AppState, key: KeyEvent) -> Option<Sett
     let Some(form) = state.settings.agent_profile_form.as_mut() else {
         return None;
     };
+    if let Some(name) = form.pending_markdown_name.as_mut() {
+        match key.code {
+            KeyCode::Esc => form.pending_markdown_name = None,
+            KeyCode::Backspace => {
+                name.pop();
+            }
+            KeyCode::Enter => {
+                if let Some(role) = form.existing_role.clone() {
+                    if !name.trim().is_empty() {
+                        return Some(SettingsAction::CreateAgentProfileMarkdown {
+                            role,
+                            name: name.trim().to_string(),
+                        });
+                    }
+                }
+            }
+            KeyCode::Char(ch) if !ch.is_control() => name.push(ch),
+            _ => {}
+        }
+        return None;
+    }
     match key.code {
         KeyCode::Esc => {
             state.settings.agent_profile_form = None;
@@ -565,6 +719,19 @@ fn update_agent_profile_form(state: &mut AppState, key: KeyEvent) -> Option<Sett
         }
         KeyCode::Left => move_agent_profile_instruction_cursor(form, false),
         KeyCode::Right => move_agent_profile_instruction_cursor(form, true),
+        KeyCode::Char('a') if form.documents_selected() => {
+            form.pending_markdown_name = Some(String::new());
+        }
+        KeyCode::Char('d') if form.documents_selected() => {
+            if let Some(index) = form.selected_markdown_index() {
+                if let Some(role) = form.existing_role.clone() {
+                    return Some(SettingsAction::DeleteAgentProfileMarkdown {
+                        role,
+                        name: form.additional_markdown[index].name.clone(),
+                    });
+                }
+            }
+        }
         KeyCode::Backspace => {
             if form.instructions_selected() {
                 delete_agent_profile_instruction_char(form, true);
@@ -576,18 +743,20 @@ fn update_agent_profile_form(state: &mut AppState, key: KeyEvent) -> Option<Sett
             delete_agent_profile_instruction_char(form, false);
         }
         KeyCode::PageUp if form.instructions_selected() => {
-            form.instructions_scroll = form.instructions_scroll.saturating_sub(8);
+            let (_, _, scroll) = form.active_document_mut();
+            *scroll = scroll.saturating_sub(8);
         }
         KeyCode::PageDown if form.instructions_selected() => {
-            form.instructions_scroll = form.instructions_scroll.saturating_add(8);
+            let (_, _, scroll) = form.active_document_mut();
+            *scroll = scroll.saturating_add(8);
         }
         KeyCode::Home if form.instructions_selected() => {
-            form.instructions_cursor =
-                instruction_line_start(&form.instructions, form.instructions_cursor);
+            let (content, cursor, _) = form.active_document_mut();
+            *cursor = instruction_line_start(content, *cursor);
         }
         KeyCode::End if form.instructions_selected() => {
-            form.instructions_cursor =
-                instruction_line_end(&form.instructions, form.instructions_cursor);
+            let (content, cursor, _) = form.active_document_mut();
+            *cursor = instruction_line_end(content, *cursor);
         }
         KeyCode::Enter
             if form.instructions_selected() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -620,12 +789,18 @@ fn agent_profile_form_field_mut(form: &mut AgentProfileForm) -> Option<&mut Stri
 
 fn move_agent_profile_instruction_cursor(form: &mut AgentProfileForm, forward: bool) {
     if form.instructions_selected() {
-        let cursor = form.instructions_cursor.min(form.instructions.len());
-        form.instructions_cursor = if forward {
-            next_instruction_boundary(&form.instructions, cursor)
+        let (content, cursor, _) = form.active_document_mut();
+        let current = (*cursor).min(content.len());
+        *cursor = if forward {
+            next_instruction_boundary(content, current)
         } else {
-            previous_instruction_boundary(&form.instructions, cursor)
+            previous_instruction_boundary(content, current)
         };
+        return;
+    }
+
+    if form.documents_selected() {
+        form.cycle_document(forward);
         return;
     }
 
@@ -664,6 +839,10 @@ pub(super) fn insert_agent_profile_form_text(state: &mut AppState, text: &str) -
     let Some(form) = state.settings.agent_profile_form.as_mut() else {
         return false;
     };
+    if let Some(name) = form.pending_markdown_name.as_mut() {
+        name.extend(text.chars().filter(|ch| !ch.is_control()));
+        return true;
+    }
     if form.instructions_selected() {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let text: String = text
@@ -681,9 +860,10 @@ pub(super) fn insert_agent_profile_form_text(state: &mut AppState, text: &str) -
 }
 
 fn insert_agent_profile_instructions(form: &mut AgentProfileForm, text: &str) {
-    let cursor = form.instructions_cursor.min(form.instructions.len());
-    form.instructions.insert_str(cursor, text);
-    form.instructions_cursor = cursor + text.len();
+    let (content, cursor, _) = form.active_document_mut();
+    let current = (*cursor).min(content.len());
+    content.insert_str(current, text);
+    *cursor = current + text.len();
 }
 
 fn previous_instruction_boundary(value: &str, cursor: usize) -> usize {
@@ -719,23 +899,18 @@ fn instruction_line_end(value: &str, cursor: usize) -> usize {
 }
 
 fn delete_agent_profile_instruction_char(form: &mut AgentProfileForm, backwards: bool) {
-    let cursor = form.instructions_cursor.min(form.instructions.len());
+    let (content, cursor, _) = form.active_document_mut();
+    let current = (*cursor).min(content.len());
     let (start, end) = if backwards {
-        (
-            previous_instruction_boundary(&form.instructions, cursor),
-            cursor,
-        )
+        (previous_instruction_boundary(content, current), current)
     } else {
-        (
-            cursor,
-            next_instruction_boundary(&form.instructions, cursor),
-        )
+        (current, next_instruction_boundary(content, current))
     };
     if start == end {
         return;
     }
-    form.instructions.replace_range(start..end, "");
-    form.instructions_cursor = start;
+    content.replace_range(start..end, "");
+    *cursor = start;
 }
 
 fn save_existing_agent_profile(
@@ -773,6 +948,10 @@ fn save_existing_agent_profile(
     })?;
     crate::agent_registry::replace_owned_instructions(&role, &form.instructions)
         .map_err(|err| crate::app::agents::AgentProfileError::PersistFailed(err.to_string()))?;
+    for markdown in &form.additional_markdown {
+        crate::agent_registry::replace_owned_markdown(&role, &markdown.name, &markdown.content)
+            .map_err(|err| crate::app::agents::AgentProfileError::PersistFailed(err.to_string()))?;
+    }
     Ok(profile)
 }
 
@@ -989,14 +1168,21 @@ impl AppState {
     fn agent_profile_form_field_at(&self, row: u16) -> Option<usize> {
         let form = self.settings.agent_profile_form.as_ref()?;
         let area = self.settings_content_rect();
-        let (first_field_y, text_field_count, document_y) = if form.is_new() {
-            (area.y + 3, 3, area.y + 6)
+        let (first_field_y, text_field_count, documents_y, document_y) = if form.is_new() {
+            (area.y + 3, 3, None, area.y + 6)
         } else {
-            (area.y + 4, 6, area.y + 11)
+            (
+                area.y + 4,
+                6,
+                Some(area.y + 10),
+                area.y + 11 + form.linked_markdown.len() as u16,
+            )
         };
         let offset = row.checked_sub(first_field_y)? as usize;
         if offset < text_field_count {
             Some(offset)
+        } else if documents_y == Some(row) {
+            form.documents_field()
         } else if row >= document_y && row < area.y.saturating_add(area.height) {
             Some(form.instructions_field())
         } else {
@@ -1129,10 +1315,12 @@ mod tests {
             apikey_ref: String::new(),
             allowlist: String::new(),
             additional_markdown: Vec::new(),
-            instructions_path: None,
+            linked_markdown: Vec::new(),
             instructions: String::new(),
             instructions_cursor: 0,
             instructions_scroll: 0,
+            selected_markdown: None,
+            pending_markdown_name: None,
             selected_field: 0,
         });
 
@@ -1185,10 +1373,12 @@ mod tests {
             apikey_ref: String::new(),
             allowlist: String::new(),
             additional_markdown: Vec::new(),
-            instructions_path: None,
+            linked_markdown: Vec::new(),
             instructions: "first line".to_string(),
             instructions_cursor: "first line".len(),
             instructions_scroll: 0,
+            selected_markdown: None,
+            pending_markdown_name: None,
             selected_field: 3,
         });
 
@@ -1215,6 +1405,80 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             ),
             Some(SettingsAction::SaveAgentProfile)
+        );
+    }
+
+    #[test]
+    fn agent_profile_documents_are_named_selected_and_edited_in_the_form() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Agents);
+        state.settings.agent_profile_form = Some(AgentProfileForm {
+            existing_role: Some("reviewer".to_string()),
+            role: "reviewer".to_string(),
+            harness: "codex".to_string(),
+            native_cwd: "/tmp".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            apikey_ref: String::new(),
+            allowlist: String::new(),
+            additional_markdown: Vec::new(),
+            linked_markdown: Vec::new(),
+            instructions: "base instructions".to_string(),
+            instructions_cursor: 0,
+            instructions_scroll: 0,
+            selected_markdown: None,
+            pending_markdown_name: None,
+            selected_field: 6,
+        });
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
+        );
+        assert!(insert_agent_profile_form_text(&mut state, "review.md"));
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::CreateAgentProfileMarkdown {
+                role: "reviewer".to_string(),
+                name: "review.md".to_string(),
+            })
+        );
+
+        let form = state.settings.agent_profile_form.as_mut().unwrap();
+        form.additional_markdown.push(AgentProfileMarkdown {
+            name: "review.md".to_string(),
+            path: "/state/agent-context/reviewer/review.md".to_string(),
+            content: String::new(),
+            cursor: 0,
+            scroll: 0,
+        });
+        form.selected_markdown = Some(0);
+        form.pending_markdown_name = None;
+        form.selected_field = form.instructions_field();
+
+        assert!(insert_agent_profile_form_text(&mut state, "Read the diff."));
+        let form = state.settings.agent_profile_form.as_ref().unwrap();
+        assert_eq!(form.instructions, "base instructions");
+        assert_eq!(form.additional_markdown[0].content, "Read the diff.");
+
+        state
+            .settings
+            .agent_profile_form
+            .as_mut()
+            .unwrap()
+            .selected_field = 6;
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::DeleteAgentProfileMarkdown {
+                role: "reviewer".to_string(),
+                name: "review.md".to_string(),
+            })
         );
     }
 

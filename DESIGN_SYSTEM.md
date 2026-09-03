@@ -13,8 +13,8 @@
 
 - **Visual style:** dense, calm, terminal-native.
 - **Mood and personality:** precise instrumentation; settings should feel like an inspectable control surface, not a wizard.
-- **Concept:** a profile is a durable dossier — concise operational settings appear above its readable `AGENTS.md`, so identity, execution settings, and instructions remain visible together.
-- **Adversarial review:** this avoids a generic card dashboard by preserving the existing flat terminal panel language and dedicating the majority of the form to the actual instruction document. The former one-line document field was the weak point and is removed.
+- **Concept:** a profile is a durable dossier with a small document cabinet — concise operational settings appear above a readable, editable `AGENTS.md` and any named profile documents, so identity, execution settings, and instructions remain visible together.
+- **Adversarial review:** this avoids a generic card dashboard and a second document screen by preserving the existing flat terminal panel language, using one document selector row, and dedicating the majority of the form to the active document. The former one-line document field was the weak point and is removed.
 - **Reference style:** no web references were used; the implementation follows the project’s existing Catppuccin-derived panel, tab, list, and modal primitives.
 - **Voice:** direct, concrete, and action-led: “inspect and change”, “not set”, and explicit save/error feedback.
 
@@ -42,14 +42,15 @@ Primary text on the default panel is 12.14:1; supporting text is 4.75:1. The UI 
 ## 5. Layout system
 
 - Settings use the existing centered 84-column panel and persistent tab placement.
-- Agent profile layout is: title → description → identity/settings rows → `AGENTS.md` path → scrollable document viewport → contextual key help.
-- `AGENTS.md` gets the flexible height; fixed settings consume only one row each.
+- Agent profile layout is: title → description → identity/settings rows → document selector → scrollable active-document viewport → contextual key help.
+- The active document gets the flexible height; fixed settings and the document selector consume only one row each.
 - Small terminals may clip the viewport, but Page Up/Page Down remain available to review the document.
 
 ## 6. Component system
 
 - **Base:** existing Ratatui modal panel, tabs, list, paragraph, and action-button helpers.
 - **Profile rows:** one shared selected/unselected row style.
+- **Document cabinet:** one selector row lists `AGENTS.md` and profile-owned `.md` filenames. It is not a nested card, file browser, or separate route.
 - **Document editor:** a `Paragraph` with preserved whitespace, shared selected-surface background, and logical-line scrolling.
 - **Feedback:** existing toast system reports saved or failed profile changes.
 
@@ -71,8 +72,9 @@ Primary text on the default panel is 12.14:1; supporting text is 4.75:1. The UI 
 ## 10. Interaction system
 
 - `↑`/`↓` or Tab select profile fields; left/right cycle harness and effort choices.
-- In `AGENTS.md`, Enter inserts a line break; Ctrl+Enter or the Save button persists settings; Escape cancels.
-- Page Up/Page Down scroll the instruction viewport. Left/right and Home/End move the instruction insertion point.
+- An existing profile opens directly on its editable `AGENTS.md` contents. In any active profile document, Enter inserts a line break; Ctrl+Enter or the Save button persists settings; Escape cancels.
+- On the document selector, `a` starts a new `.md` filename, left/right select `AGENTS.md` or a named document, and `d` deletes only the selected named document.
+- Page Up/Page Down scroll the active document viewport. Left/right and Home/End move the insertion point while editing it.
 - All failures use the existing labeled toast; no action fails silently.
 - No animation is introduced for this terminal surface.
 
@@ -81,7 +83,7 @@ Primary text on the default panel is 12.14:1; supporting text is 4.75:1. The UI 
 - The whole form is keyboard-operable.
 - Text status never depends on color alone.
 - Default palette body/support text pair contrast is recorded in §3; theme customization remains semantic.
-- `AGENTS.md` preserves user-authored whitespace and is reviewable without copying it elsewhere.
+- Every profile document preserves user-authored whitespace and is reviewable without copying it into a Space or project directory.
 
 ## 12. Anti-slop rules
 
@@ -92,7 +94,7 @@ Primary text on the default panel is 12.14:1; supporting text is 4.75:1. The UI 
 
 ## 13. Future UI instructions
 
-Reuse the existing settings panel, palette roles, rows, action buttons, and contextual key hints. Keep persistent profile facts and its instruction document together; do not add a second disconnected profile settings screen.
+Reuse the existing settings panel, palette roles, rows, action buttons, and contextual key hints. Keep persistent profile facts and its document cabinet together; do not add a second disconnected profile settings screen.
 
 ## 14. Update policy
 
