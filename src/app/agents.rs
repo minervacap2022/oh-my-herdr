@@ -1393,6 +1393,32 @@ impl App {
             .collect())
     }
 
+    pub(super) fn delete_profile(
+        &mut self,
+        role: &str,
+    ) -> Result<AgentProfileInfo, AgentProfileError> {
+        if !valid_agent_name(role) {
+            return Err(AgentProfileError::InvalidRole);
+        }
+        self.refresh_agent_registry_for_read()
+            .map_err(|err| AgentProfileError::LoadFailed(err.to_string()))?;
+        if self.agent_registry.get(role).is_none() {
+            return Err(AgentProfileError::NotFound(role.to_string()));
+        }
+        let role = role.to_string();
+        let registry_role = role.clone();
+        let removed = self
+            .update_agent_registry(move |registry| registry.remove_profile(&registry_role))
+            .map_err(|err| AgentProfileError::PersistFailed(err.to_string()))?
+            .ok_or_else(|| AgentProfileError::NotFound(role.clone()))?;
+        if !self.no_session {
+            if let Err(err) = crate::agent_registry::remove_owned_instructions(&removed.role) {
+                tracing::warn!(err = %err, role = %removed.role, "failed to remove deleted agent profile instructions");
+            }
+        }
+        Ok(profile_info(&removed))
+    }
+
     pub(super) fn create_profile(
         &mut self,
         params: AgentProfileCreateParams,
@@ -2592,6 +2618,30 @@ mod tests {
         assert_eq!(cleared.mds.len(), 1);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_profile_removes_saved_profile_and_archived_roster() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.set_profile_md("reviewer", "context.md", None).unwrap();
+        app.agent_registry.roster_register(
+            "reviewer-replica-1",
+            "reviewer",
+            "reviewer",
+            "-replica-1",
+            None,
+        );
+        assert!(app.delete_profile("reviewer").is_ok());
+        assert!(app.agent_registry.get("reviewer").is_none());
+        assert!(app.agent_registry.roster.is_empty());
+        assert!(app.state.saved_agent_profiles.is_empty());
     }
 
     #[test]

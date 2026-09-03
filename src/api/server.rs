@@ -428,6 +428,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentProfileGet(_) => "agent.profile.get",
         Method::AgentProfileList(_) => "agent.profile.list",
         Method::AgentProfileSet(_) => "agent.profile.set",
+        Method::AgentProfileDelete(_) => "agent.profile.delete",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentBroadcast(_) => "agent.broadcast",
         Method::AgentWait(_) => "agent.wait",

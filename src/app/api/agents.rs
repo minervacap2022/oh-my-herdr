@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentBroadcastParams, AgentProfileCreateParams, AgentProfileSetMdParams, AgentPromptParams,
-    AgentRenameParams, AgentReviveParams, AgentRosterEntryInfo, AgentRosterStatus,
-    AgentSendKeysParams, AgentSpawnParams, AgentStartParams, AgentTarget, PaneReadResult,
-    ResponseResult,
+    AgentBroadcastParams, AgentProfileCreateParams, AgentProfileDeleteParams,
+    AgentProfileSetMdParams, AgentPromptParams, AgentRenameParams, AgentReviveParams,
+    AgentRosterEntryInfo, AgentRosterStatus, AgentSendKeysParams, AgentSpawnParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -274,6 +274,20 @@ impl App {
     ) -> String {
         match self.set_profile(params) {
             Ok(profile) => encode_success(id, ResponseResult::AgentProfileInfo { profile }),
+            Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
+        }
+    }
+
+    pub(super) fn handle_agent_profile_delete(
+        &mut self,
+        id: String,
+        params: AgentProfileDeleteParams,
+    ) -> String {
+        match self.delete_profile(&params.role) {
+            Ok(profile) => encode_success(
+                id,
+                ResponseResult::AgentProfileDeleted { role: profile.role },
+            ),
             Err(err) => encode_error_body(id, self.agent_profile_error_body(err)),
         }
     }

@@ -607,7 +607,10 @@ fn main() -> io::Result<()> {
             }
             Err(err) => {
                 eprintln!("{err}");
-                eprintln!("usage: herdr update [--handoff]");
+                eprintln!(
+                    "usage: {} update [--handoff]",
+                    crate::config::product_name()
+                );
                 std::process::exit(2);
             }
         };

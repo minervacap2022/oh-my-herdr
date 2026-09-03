@@ -150,7 +150,10 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
 
 fn channel_set(args: &[String]) -> std::io::Result<i32> {
     let Some(channel) = parse_channel_set_arg(args) else {
-        eprintln!("usage: herdr channel set <stable|preview>");
+        eprintln!(
+            "usage: {} channel set <stable|preview>",
+            crate::config::product_name()
+        );
         return Ok(2);
     };
 
@@ -194,7 +197,8 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     }
     std::fs::write(&path, updated)?;
     println!(
-        "Herdr update channel set to {channel} in {}.",
+        "{} update channel set to {channel} in {}.",
+        crate::config::product_name(),
         path.display()
     );
 
@@ -210,7 +214,10 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
-        eprintln!("Run `herdr update` to retry.");
+        eprintln!(
+            "Run `{}` to retry.",
+            crate::update::update_install_command()
+        );
         return Ok(1);
     }
 

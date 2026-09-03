@@ -633,6 +633,28 @@ fn legacy_registry_path() -> PathBuf {
     crate::config::config_dir().join(REGISTRY_FILENAME)
 }
 
+fn owned_instructions_path_at(registry: &Path, role: &str) -> PathBuf {
+    registry
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PROFILE_CONTEXT_DIRECTORY)
+        .join(role)
+        .join(PROFILE_INSTRUCTIONS_FILENAME)
+}
+
+/// Return the durable path for a profile-owned `AGENTS.md` file.
+pub fn owned_instructions_path(role: &str) -> PathBuf {
+    let registry = registry_path();
+    let target = resolve_write_target(&registry).unwrap_or(registry);
+    owned_instructions_path_at(&target, role)
+}
+
+/// Read a profile-owned `AGENTS.md` without touching user-supplied Markdown
+/// attachments.
+pub fn read_owned_instructions(role: &str) -> std::io::Result<String> {
+    std::fs::read_to_string(owned_instructions_path(role))
+}
+
 /// Materialize a profile-owned instruction file without changing registry
 /// state. Callers that persist a profile should add this path as `AGENTS.md`.
 pub fn write_owned_instructions(path: &Path, instructions: &str) -> std::io::Result<()> {
@@ -647,6 +669,63 @@ pub fn write_owned_instructions(path: &Path, instructions: &str) -> std::io::Res
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(instructions.as_bytes())?;
     file.sync_all()
+}
+
+/// Atomically replace a profile-owned `AGENTS.md`. The target must already
+/// exist; this prevents an edit from creating an unregistered context file.
+pub fn replace_owned_instructions(role: &str, instructions: &str) -> std::io::Result<()> {
+    let target = owned_instructions_path(role);
+    replace_owned_instructions_at_path(&target, instructions)
+}
+
+fn replace_owned_instructions_at_path(target: &Path, instructions: &str) -> std::io::Result<()> {
+    if instructions.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "agent instructions must not contain NUL bytes",
+        ));
+    }
+    if !target.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("profile instructions {} do not exist", target.display()),
+        ));
+    }
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let temp_id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(PROFILE_INSTRUCTIONS_FILENAME),
+        std::process::id(),
+        temp_id,
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    if let Err(err) = file
+        .write_all(instructions.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(err);
+    }
+    drop(file);
+    if let Err(err) = crate::platform::replace_file(&temporary, target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(err);
+    }
+    if let Err(err) = sync_parent_directory(target) {
+        warn!(
+            path = %target.display(),
+            err = %err,
+            "profile instruction replacement committed but parent directory sync failed"
+        );
+    }
+    Ok(())
 }
 
 fn with_registry_lock<T>(
@@ -722,6 +801,21 @@ pub fn create_with_owned_instructions(
     })
 }
 
+/// Remove the session-owned instruction directory for a deleted profile.
+/// User-supplied Markdown files referenced by the profile are never touched.
+pub fn remove_owned_instructions(role: &str) -> std::io::Result<()> {
+    let directory = registry_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PROFILE_CONTEXT_DIRECTORY)
+        .join(role);
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// Add a session-owned `AGENTS.md` to profiles that predate owned
 /// instructions. Existing named Markdown remains untouched. This is the
 /// one-time shape migration for registries created before profile creation
@@ -732,10 +826,6 @@ pub fn ensure_owned_instructions() -> std::io::Result<AgentRegistry> {
 
 fn ensure_owned_instructions_at_path(target: &Path) -> std::io::Result<AgentRegistry> {
     let mut registry = load_for_update(target)?;
-    let context_root = target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(PROFILE_CONTEXT_DIRECTORY);
     let mut created = Vec::new();
     let mut changed = false;
 
@@ -748,9 +838,7 @@ fn ensure_owned_instructions_at_path(target: &Path) -> std::io::Result<AgentRegi
             continue;
         }
 
-        let path = context_root
-            .join(&profile.role)
-            .join(PROFILE_INSTRUCTIONS_FILENAME);
+        let path = owned_instructions_path_at(target, &profile.role);
         match write_owned_instructions(&path, &format!("# {} agent\n", profile.role)) {
             Ok(()) => created.push(path.clone()),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -789,12 +877,7 @@ fn create_with_owned_instructions_at_path(
         ));
     }
 
-    let context_path = target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(PROFILE_CONTEXT_DIRECTORY)
-        .join(&profile.role)
-        .join(PROFILE_INSTRUCTIONS_FILENAME);
+    let context_path = owned_instructions_path_at(target, &profile.role);
     write_owned_instructions(&context_path, instructions)?;
 
     profile.set_md(PROFILE_INSTRUCTIONS_FILENAME, context_path.clone());
@@ -1227,6 +1310,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&instructions).unwrap(),
             "# Reviewer\n\nReview the current change.\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_instructions_are_replaced_atomically_with_multiline_content() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-agent-profile-instructions-replace-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let path = root.join(PROFILE_INSTRUCTIONS_FILENAME);
+        std::fs::create_dir_all(&root).unwrap();
+        write_owned_instructions(&path, "before").unwrap();
+
+        replace_owned_instructions_at_path(&path, "first line\nsecond line\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first line\nsecond line\n"
+        );
+        assert!(replace_owned_instructions_at_path(&path, "bad\0input").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first line\nsecond line\n"
         );
         let _ = std::fs::remove_dir_all(root);
     }

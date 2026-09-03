@@ -102,8 +102,8 @@ pub fn active_name() -> Option<String> {
 
 pub fn local_attach_command() -> String {
     match active_name() {
-        Some(name) => format!("herdr session attach {name}"),
-        None => "herdr".to_string(),
+        Some(name) => format!("{} session attach {name}", crate::config::product_name()),
+        None => crate::config::product_name().to_string(),
     }
 }
 
@@ -113,15 +113,18 @@ pub fn local_stop_command() -> String {
 
 pub fn stop_command_for(name: Option<&str>) -> String {
     match name {
-        Some(name) => format!("herdr session stop {name}"),
-        None => "herdr server stop".to_string(),
+        Some(name) => format!("{} session stop {name}", crate::config::product_name()),
+        None => format!("{} server stop", crate::config::product_name()),
     }
 }
 
 pub fn restart_after_update_guidance(stop_command: &str, attach_command: Option<&str>) -> String {
     let restart = match attach_command {
         Some(command) => format!("Run `{stop_command}`, then run `{command}` again."),
-        None => format!("Run `{stop_command}`, then restart Herdr with the same socket override."),
+        None => format!(
+            "Run `{stop_command}`, then restart {} with the same socket override.",
+            crate::config::product_name()
+        ),
     };
     format!(
         "Stop the old server to use the new version.\nStopping exits pane processes.\n{restart}"
@@ -133,9 +136,10 @@ pub fn active_restart_after_update_guidance() -> String {
         if let Ok(socket_path) = std::env::var(crate::api::SOCKET_PATH_ENV_VAR) {
             return restart_after_update_guidance(
                 &format!(
-                    "{}={} herdr server stop",
+                    "{}={} {} server stop",
                     crate::api::SOCKET_PATH_ENV_VAR,
-                    socket_path
+                    socket_path,
+                    crate::config::product_name()
                 ),
                 None,
             );
@@ -899,7 +903,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
 
-        assert_eq!(local_attach_command(), "herdr");
+        assert_eq!(local_attach_command(), crate::config::product_name());
     }
 
     #[test]
@@ -907,7 +911,10 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "work");
 
-        assert_eq!(local_attach_command(), "herdr session attach work");
+        assert_eq!(
+            local_attach_command(),
+            format!("{} session attach work", crate::config::product_name())
+        );
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -917,7 +924,10 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
 
-        assert_eq!(local_stop_command(), "herdr server stop");
+        assert_eq!(
+            local_stop_command(),
+            format!("{} server stop", crate::config::product_name())
+        );
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -927,7 +937,10 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "work");
 
-        assert_eq!(local_stop_command(), "herdr session stop work");
+        assert_eq!(
+            local_stop_command(),
+            format!("{} session stop work", crate::config::product_name())
+        );
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -936,10 +949,17 @@ mod tests {
     fn restart_after_update_guidance_names_stop_and_attach_commands() {
         assert_eq!(
             restart_after_update_guidance(
-                "herdr session stop work",
-                Some("herdr session attach work")
+                &format!("{} session stop work", crate::config::product_name()),
+                Some(&format!(
+                    "{} session attach work",
+                    crate::config::product_name()
+                ))
             ),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `herdr session stop work`, then run `herdr session attach work` again."
+            format!(
+                "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `{} session stop work`, then run `{} session attach work` again.",
+                crate::config::product_name(),
+                crate::config::product_name()
+            )
         );
     }
 
@@ -952,7 +972,11 @@ mod tests {
 
         assert_eq!(
             active_restart_after_update_guidance(),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `HERDR_SOCKET_PATH=/tmp/custom-herdr.sock herdr server stop`, then restart Herdr with the same socket override."
+            format!(
+                "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `HERDR_SOCKET_PATH=/tmp/custom-herdr.sock {} server stop`, then restart {} with the same socket override.",
+                crate::config::product_name(),
+                crate::config::product_name()
+            )
         );
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);

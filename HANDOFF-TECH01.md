@@ -200,3 +200,229 @@ The former TUI client disconnected as part of the isolated server restart. In
 that terminal, run `ohmyherdr` again to attach to the repaired product. No
 stable Herdr process, socket, binary, or state was changed. The current tracked
 diff SHA-256 is `42741ec41cd58a699646bdc8a28d6c95135148c2b7ca224e846ca053d1dd1486`.
+
+## 2026-09-02 follow-up: delete profiles and product-only update routing
+
+The current uncommitted tree adds a complete saved-agent deletion path. It is
+intentionally profile deletion, not a hidden way to close arbitrary live panes:
+
+- In the Agents sidebar, click a saved profile and choose **Delete profile**.
+  The same menu offers **Use space cwd**, **Use agent native cwd**, and
+  **Edit profile**.
+- In **Settings → Agents**, select a saved profile. The rendered instruction is
+  `enter starts • e edits • d deletes a saved profile`; press `d` to delete it.
+- The API is `agent.profile.delete`, and the explicit command-line escape hatch
+  is `ohmyherdr agent profile delete <role>`.
+
+Deleting removes the saved profile, its roster records, and its
+profile-owned `agent-context/<role>/AGENTS.md`. It does not issue a pane-close
+request; use the existing **Close pane** action for a running pane.
+
+A live isolated-product smoke test created the temporary `deleteme` Codex
+profile with native cwd `/tmp`, deleted it through the new command, verified
+the `agent_profile_deleted` response, and then verified that a subsequent get
+returned `agent_profile_not_found`. Its temporary context directory is gone.
+No existing profile was used for this test.
+
+The production launcher no longer points at a hash-named build artifact:
+
+```text
+launcher        /Users/tech01/oh-my-herdr/.local/ohmyherdr/bin/ohmyherdr-handoff
+launcher SHA-256 aa5693907f182e9a56ca933039e767a08d4587bc09cd8b7811b5896fdcbc8b00
+next product exe /Users/tech01/oh-my-herdr/.local/ohmyherdr/bin/ohmyherdr
+next product SHA-256 5ff6909c59fba5c2652dcc4943b53ff48a7d17ea7ac32f10a6a354882b28d984
+PATH shim       /Users/tech01/.local/bin/ohmyherdr
+PATH shim SHA-256 22e8538531cb99bcdc4ad00316b1db55a3dc71a4a92de08b59395acf461a6b4a
+```
+
+That fixed executable path is the target the native updater atomically
+replaces, so future upgrades do not accumulate new hash-named launch targets.
+
+### Important runtime event
+
+I restarted `com.ohmyherdr.isolated` once to put the new deletion UI into the
+running product. That was a mistake while live product panes existed: it
+terminated their prior processes. The isolated session restored its four
+Spaces and launched replacement panes, but prior in-flight agent processes
+were interrupted. I did **not** restart it a second time for the OTA routing
+change; PID `12425` remains running. The next product restart will load the
+on-disk `5ff690…` binary. Stable Herdr was unaffected:
+
+```text
+stable PID       7810 (PPID 7809)
+stable binary    /Users/tech01/.local/bin/herdr
+stable SHA-256   37350546b0012555943b92eaf962665de4e264395baeb44227b8015e8ff5b0d6
+stable sockets   /Users/tech01/.config/herdr/herdr.sock
+                 /Users/tech01/.config/herdr/herdr-client.sock
+product PID      12425 (PPID 1)
+product sockets  /Users/tech01/.config/ohmyherdr/ohmyherdr.sock
+                 /Users/tech01/.config/ohmyherdr/ohmyherdr-client.sock
+```
+
+### Native OTA status
+
+The source now makes the compile-time OhMyHerdr build use only this product
+endpoint for both direct update checks and remote binary lookup:
+
+```text
+https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-latest.json
+```
+
+It never falls back to `https://herdr.dev/latest.json`, forces the product to
+its stable product channel (so a copied `preview` config cannot select Herdr's
+preview feed), and prints `ohmyherdr update` / `ohmyherdr server stop` in its
+guidance. The manifest-selection test covers the stable-vs-product separation
+under both ordinary and `OHMYHERDR_BUILD=1` compilation. The remote installer
+uses the same selector.
+
+There is one real blocker to a downloadable OTA: `minervacap2022/oh-my-herdr`
+currently has **no GitHub Release** and therefore no
+`ohmyherdr-latest.json` asset. An anonymous request to the exact product URL
+returned HTTP 404 on 2026-09-02. A release publisher must publish that manifest
+with platform assets and SHA-256 values at the endpoint (and make that endpoint
+reachable to intended product users). Until then the code is isolated and safe
+from Herdr, but a real network update cannot be completed or end-to-end tested.
+
+### Follow-up validation
+
+- `cargo fmt --all -- --check`, `cargo check --bin herdr`, and `git diff --check` passed.
+- Full serialized binary suite: **3,404 passed, 0 failed, 1 ignored**.
+- Product-compiled test (`OHMYHERDR_BUILD=1`): product manifest selection and
+  product session command tests passed.
+- The branded launcher’s help and `status server` reach only the OhMyHerdr
+  product socket; the isolated server reports protocol 21 and compatibility.
+- No commit was made. The working tree has 24 modified tracked files; all are
+  the deletion, product-command, and product-update isolation work described
+  above.
+
+## 2026-09-03 follow-up: readable profile details and multiline AGENTS.md
+
+The saved-agent editor previously had three product defects:
+
+1. Opening an existing profile deliberately loaded `instructions: String::new()`,
+   so its profile-owned `AGENTS.md` could not be viewed.
+2. Pasted newlines were filtered out, and Enter always saved the whole form.
+   Long instructions therefore appeared as one line and could not be edited as
+   a document.
+3. The edit screen only exposed the harness and native cwd, even though model,
+   effort, API-key reference, tool allowlist, and additional injected Markdown
+   are all durable profile settings.
+
+The Agents settings flow now opens a profile dossier through the existing **e
+edit** action (and the existing sidebar **Edit profile** action): it renders
+and edits harness, native cwd, model, effort, API-key reference, and tool
+allowlist; lists additional Markdown attachments; displays the owned
+`AGENTS.md` path; and renders the real, newline-preserving document in a
+scrollable viewport. While that document is selected:
+
+- **Enter** inserts a line break.
+- **Ctrl+Enter** saves.
+- **Page Up/Page Down** scrolls.
+- **Left/Right** and **Home/End** move the insertion point.
+
+Profile instruction writes are atomic replacements of the existing owned file;
+NUL input is rejected and cannot partially overwrite the previous document.
+
+Source and test additions:
+
+- `src/app/input/settings.rs` — profile details, all editable saved settings,
+  multiline input/navigation/paste behavior.
+- `src/ui/settings.rs` — compact settings rows above a flexible, readable
+  `AGENTS.md` viewport.
+- `src/agent_registry.rs` — owned-instruction path/read/atomic replacement.
+- `DESIGN_SYSTEM.md` — the terminal-native profile dossier layout and existing
+  palette/component rules for future UI work.
+
+Verification on 2026-09-03:
+
+- Full serialized binary suite: **3,408 passed, 0 failed, 1 ignored**.
+- Added deterministic coverage for multiline paste + Enter/Ctrl+Enter, rendered
+  profile details + multiline document, and atomic instruction replacement.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+### Product artifact state
+
+The verified branded product build was staged atomically at:
+
+```text
+/Users/tech01/oh-my-herdr/.local/ohmyherdr/bin/ohmyherdr
+SHA-256 4995fe97ee92694d0958a04cb8ce61074f5056a64b8283d0ab709009be0af92f
+```
+
+It was built with:
+
+```text
+DEVELOPER_DIR=/Library/Developer/CommandLineTools
+ZIG=/opt/homebrew/opt/zig@0.15/bin/zig
+OHMYHERDR_BUILD=1
+HERDR_BUILD_CHANNEL=ohmyherdr
+HERDR_BUILD_ID=beta.20260902
+```
+
+The previously recorded `/Applications/Xcode-26.6.0.app/Contents/Developer`
+path no longer exists, so an initial build attempt stopped before staging. The
+Command Line Tools rebuild succeeded.
+
+**The running isolated server was intentionally not restarted or controlled.**
+This agent was outside a Herdr-managed pane, and the running product owns live
+agent panes. Its PID remains `12425`; it still holds the pre-stage executable
+inode (19,848,736 bytes), while the new on-disk file will be used by the next
+safe live handoff or normal product restart. The isolated product is healthy:
+
+```text
+product PID     12425
+product socket  /Users/tech01/.config/ohmyherdr/ohmyherdr.sock
+client socket   /Users/tech01/.config/ohmyherdr/ohmyherdr-client.sock
+protocol        21 (live handoff supported)
+```
+
+Stable Herdr remains separate and unchanged:
+
+```text
+stable binary   /Users/tech01/.local/bin/herdr
+stable SHA-256  37350546b0012555943b92eaf962665de4e264395baeb44227b8015e8ff5b0d6
+stable PID      7810
+stable socket   /Users/tech01/.config/herdr/herdr.sock
+protocol        17
+```
+
+Current uncommitted binary diff SHA-256:
+
+```text
+80632b148b7c3c15913a56dbfbf2ac26d41d6bc4fa6d9464310990d9ab664956
+```
+
+## 2026-09-03 production OTA release
+
+The user explicitly approved publishing this product. The product repository is
+now public at `https://github.com/minervacap2022/oh-my-herdr`; stable Herdr's
+repository, binary, server, socket, and update endpoint were not changed.
+
+The first product OTA is version `0.8.3`. The release workflow is deliberately
+separate from the upstream `v*` release workflow:
+
+```text
+.github/workflows/ohmyherdr-release.yml
+tag: ohmyherdr-v0.8.3
+manifest asset: ohmyherdr-latest.json
+artifact: ohmyherdr-macos-aarch64
+```
+
+It builds with `OHMYHERDR_BUILD=1`, publishes the product-only manifest URL
+used by the native updater, and includes the artifact SHA-256 in that manifest.
+The custom tag cannot trigger the upstream `Release` workflow because it does
+not start with `v`.
+
+Local production build verification passed with:
+
+```text
+version: ohmyherdr 0.8.3-ohmyherdr.0.8.3
+SHA-256: 11e8fcd289f679a7cb0bd9d8bb74716ccbc77d393f1aa4e072757f0c15f4ac5b
+target: aarch64-apple-darwin
+```
+
+This first product release intentionally advertises only `macos-aarch64`.
+Publishing a Windows artifact before making its installer use an independent
+OhMyHerdr install path would risk writing to stable Herdr's install directory,
+which is prohibited. Linux and Intel macOS are likewise not advertised until
+their product-native installation paths are released and verified.

@@ -291,6 +291,13 @@ pub struct AgentProfileGetParams {
     pub role: String,
 }
 
+/// Delete a saved profile. Live panes are not closed by this operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentProfileDeleteParams {
+    #[schemars(regex(pattern = "^[a-z][a-z0-9_-]{0,31}$"))]
+    pub role: String,
+}
+
 /// Atomically edit saved profile settings. The agent role itself and the roster
 /// identity are immutable; clearing uses explicit flags so omitted fields remain
 /// unchanged.

@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentProfileCreateParams, AgentProfileGetParams, AgentPromptParams, AgentPromptWaitOptions,
-    AgentReadParams, AgentRenameParams, AgentReviveParams, AgentSendKeysParams, AgentSpawnParams,
-    AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody, ErrorResponse, Method,
-    PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentProfileCreateParams, AgentProfileDeleteParams, AgentProfileGetParams, AgentPromptParams,
+    AgentPromptWaitOptions, AgentReadParams, AgentRenameParams, AgentReviveParams,
+    AgentSendKeysParams, AgentSpawnParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -108,6 +109,9 @@ fn agent_create(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_profile(args: &[String]) -> std::io::Result<i32> {
+    if args.first().map(String::as_str) == Some("delete") {
+        return agent_profile_delete(&args[1..]);
+    }
     let Some(role) = args.first() else {
         eprintln!("usage: herdr agent profile <ROLE>");
         return Ok(2);
@@ -119,6 +123,21 @@ fn agent_profile(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:profile".into(),
         method: Method::AgentProfileGet(AgentProfileGetParams { role: role.clone() }),
+    })?)
+}
+
+fn agent_profile_delete(args: &[String]) -> std::io::Result<i32> {
+    let Some(role) = args.first() else {
+        eprintln!("usage: herdr agent profile delete <ROLE>");
+        return Ok(2);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: herdr agent profile delete <ROLE>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:profile:delete".into(),
+        method: Method::AgentProfileDelete(AgentProfileDeleteParams { role: role.clone() }),
     })?)
 }
 
@@ -1215,6 +1234,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent roster");
     eprintln!("  herdr agent create <role> --harness codex|pi|claude --cwd DIR [--instructions-file PATH]");
     eprintln!("  herdr agent profile <role>");
+    eprintln!("  herdr agent profile delete <role>");
     eprintln!("  herdr agent profiles");
     eprintln!("  herdr agent revive <instance-id> [--tab TAB] [--cwd tab|agent] [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");

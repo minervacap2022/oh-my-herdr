@@ -1,7 +1,7 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted herdr.dev update manifest for newer versions.
-//! Manual `herdr update` downloads and installs the binary.
+//! Checks the product-specific update manifest for newer versions.
+//! Manual product updates download and install the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
 //! JSON parsing uses serde_json (already in deps for persistence).
@@ -24,8 +24,11 @@ use serde::{Deserialize, Deserializer};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+const OHMYHERDR_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-latest.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
+const OHMYHERDR_UPDATE_COMMAND: &str = "ohmyherdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
@@ -106,6 +109,9 @@ enum UpdateChannel {
 
 impl UpdateChannel {
     fn configured() -> Self {
+        if crate::build_info::is_ohmyherdr() {
+            return Self::Stable;
+        }
         match crate::config::Config::load().config.update.channel {
             crate::config::UpdateChannelConfig::Stable => Self::Stable,
             crate::config::UpdateChannelConfig::Preview => Self::Preview,
@@ -320,7 +326,19 @@ impl ReleaseInfo {
 }
 
 fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(stable_update_manifest_url())
+}
+
+pub(crate) fn stable_update_manifest_url() -> &'static str {
+    stable_update_manifest_url_for_product(crate::build_info::is_ohmyherdr())
+}
+
+fn stable_update_manifest_url_for_product(is_ohmyherdr: bool) -> &'static str {
+    if is_ohmyherdr {
+        OHMYHERDR_UPDATE_MANIFEST_URL
+    } else {
+        STABLE_UPDATE_MANIFEST_URL
+    }
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
@@ -946,27 +964,33 @@ fn plan_running_server_updates(
         )
         .map_err(|err| {
             format!(
-                "failed to read status for herdr target {} at {}: {err}. stop it with `{}` and run `herdr update` again",
+                "failed to read status for {} target {} at {}: {err}. stop it with `{}` and run `{}` again",
+                crate::config::product_name(),
                 target.label,
                 target.socket_path.display(),
-                target.stop_command
+                target.stop_command,
+                direct_update_command(),
             )
         })? {
             Some(server) => server,
             None if target.must_be_running => {
                 return Err(format!(
-                        "herdr target {} looked running, but its status API did not respond at {}. stop it with `{}` and run `herdr update` again",
+                        "{} target {} looked running, but its status API did not respond at {}. stop it with `{}` and run `{}` again",
+                    crate::config::product_name(),
                     target.label,
                     target.socket_path.display(),
-                    target.stop_command
+                    target.stop_command,
+                    direct_update_command()
                 ));
             }
             None if client_protocol_server_is_running_at(&target.client_socket_path) => {
                 return Err(format!(
-                    "herdr target {} has a client socket, but its status API did not respond at {}. stop it with `{}` and run `herdr update` again",
+                    "{} target {} has a client socket, but its status API did not respond at {}. stop it with `{}` and run `{}` again",
+                    crate::config::product_name(),
                     target.label,
                     target.socket_path.display(),
-                    target.stop_command
+                    target.stop_command,
+                    direct_update_command()
                 ));
             }
             None => continue,
@@ -981,8 +1005,10 @@ fn plan_running_server_updates(
 
     if plans.is_empty() && target_client_protocol_server_is_running()? {
         return Err(format!(
-            "a herdr server is listening, but its status API is unavailable; try `{}`, or stop the old server process manually, then run `herdr update` again",
-            crate::session::local_stop_command()
+            "a {} server is listening, but its status API is unavailable; try `{}`, or stop the old server process manually, then run `{}` again",
+            crate::config::product_name(),
+            crate::session::local_stop_command(),
+            direct_update_command()
         ));
     }
 
@@ -1022,9 +1048,10 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
             name: None,
             label: socket_path.display().to_string(),
             stop_command: format!(
-                "{}={} herdr server stop",
+                "{}={} {} server stop",
                 crate::api::SOCKET_PATH_ENV_VAR,
-                socket_path.display()
+                socket_path.display(),
+                crate::config::product_name()
             ),
             attach_command: None,
             client_socket_path: crate::server::socket_paths::client_socket_path_from_overrides(
@@ -1036,8 +1063,12 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
         }]);
     }
 
-    let sessions = crate::session::list_sessions()
-        .map_err(|err| format!("failed to list herdr sessions: {err}"))?;
+    let sessions = crate::session::list_sessions().map_err(|err| {
+        format!(
+            "failed to list {} sessions: {err}",
+            crate::config::product_name()
+        )
+    })?;
     Ok(sessions
         .into_iter()
         .map(|session| RunningUpdateTarget {
@@ -1052,9 +1083,13 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
                 Some(&session.name)
             }),
             attach_command: Some(if session.default {
-                "herdr".to_string()
+                crate::config::product_name().to_string()
             } else {
-                format!("herdr session attach {}", session.name)
+                format!(
+                    "{} session attach {}",
+                    crate::config::product_name(),
+                    session.name
+                )
             }),
             label: session.name.clone(),
             client_socket_path: crate::session::client_socket_path_for(if session.default {
@@ -1076,8 +1111,12 @@ fn target_client_protocol_server_is_running() -> Result<bool, String> {
         return Ok(client_protocol_server_is_running());
     }
 
-    let sessions = crate::session::list_sessions()
-        .map_err(|err| format!("failed to list herdr sessions: {err}"))?;
+    let sessions = crate::session::list_sessions().map_err(|err| {
+        format!(
+            "failed to list {} sessions: {err}",
+            crate::config::product_name()
+        )
+    })?;
     Ok(sessions.into_iter().any(|session| {
         let client_socket = crate::session::client_socket_path_for(if session.default {
             None
@@ -1099,7 +1138,10 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
         match arg.as_str() {
             "--handoff" => options.live_handoff = true,
             "--help" | "-h" => {
-                return Err("usage: herdr update [--handoff]".to_string());
+                return Err(format!(
+                    "usage: {} update [--handoff]",
+                    crate::config::product_name()
+                ));
             }
             _ => return Err(format!("unknown update option: {arg}")),
         }
@@ -1114,8 +1156,12 @@ fn prompt_to_stop_old_servers_before_update(
 ) -> Result<bool, String> {
     if !io::stdin().is_terminal() {
         return Err(
-            "one or more Herdr sessions must stop for this update. Stop running Herdr sessions when ready, then run `herdr update` again from an interactive terminal."
-                .to_string(),
+            format!(
+                "one or more {} sessions must stop for this update. Stop running {} sessions when ready, then run `{}` again from an interactive terminal.",
+                crate::config::product_name(),
+                crate::config::product_name(),
+                direct_update_command()
+            ),
         );
     }
 
@@ -1866,7 +1912,9 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
-    if is_homebrew_managed_install() {
+    if crate::build_info::is_ohmyherdr() {
+        OHMYHERDR_UPDATE_COMMAND
+    } else if is_homebrew_managed_install() {
         HOMEBREW_UPDATE_COMMAND
     } else if is_mise_managed_install() {
         MISE_UPDATE_COMMAND
@@ -1877,8 +1925,19 @@ pub(crate) fn update_install_command() -> &'static str {
     }
 }
 
+fn direct_update_command() -> &'static str {
+    if crate::build_info::is_ohmyherdr() {
+        OHMYHERDR_UPDATE_COMMAND
+    } else {
+        HERDR_UPDATE_COMMAND
+    }
+}
+
 pub(crate) fn update_install_instruction(install_command: &str) -> String {
     match install_command {
+        OHMYHERDR_UPDATE_COMMAND => {
+            "detach, run `ohmyherdr update`, then follow its restart guidance".to_string()
+        }
         HERDR_UPDATE_COMMAND => {
             "detach, run `herdr update`, then follow its restart guidance".to_string()
         }
@@ -1921,6 +1980,9 @@ fn is_mise_managed_install() -> bool {
 }
 
 pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static str> {
+    if crate::build_info::is_ohmyherdr() {
+        return Some("preview updates are not available for OhMyHerdr");
+    }
     let Ok(current_exe) = env::current_exe() else {
         return None;
     };
@@ -2127,7 +2189,11 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     }
 
     if running_inside_herdr() {
-        return Err("run `herdr update` outside herdr after detaching from the session".into());
+        return Err(format!(
+            "run `{}` outside {} after detaching from the session",
+            direct_update_command(),
+            crate::config::product_name()
+        ));
     }
 
     eprintln!("checking {} channel for updates...", channel.as_str());
@@ -2186,8 +2252,12 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         if !options.live_handoff
             && !prompt_to_complete_plain_update(&server_update_decisions, &release)?
         {
-            eprintln!("Herdr was not updated.");
-            eprintln!("Stop running Herdr sessions when ready, then run `herdr update` again.");
+            eprintln!("{} was not updated.", crate::config::product_name());
+            eprintln!(
+                "Stop running {} sessions when ready, then run `{}` again.",
+                crate::config::product_name(),
+                direct_update_command()
+            );
             return Ok(current);
         }
         install_downloaded_update(downloaded_update)?;
@@ -2742,6 +2812,18 @@ mod tests {
         assert_eq!(
             update_install_instruction(MISE_UPDATE_COMMAND),
             "detach, run `mise upgrade herdr`, then restart this Herdr session when ready"
+        );
+    }
+
+    #[test]
+    fn product_manifest_url_isolated_from_stable_manifest() {
+        assert_eq!(
+            stable_update_manifest_url_for_product(false),
+            "https://herdr.dev/latest.json"
+        );
+        assert_eq!(
+            stable_update_manifest_url_for_product(true),
+            "https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-latest.json"
         );
     }
 

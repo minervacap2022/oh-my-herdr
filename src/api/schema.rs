@@ -139,6 +139,8 @@ pub enum Method {
     AgentProfileList(EmptyParams),
     #[serde(rename = "agent.profile.set")]
     AgentProfileSet(AgentProfileSetParams),
+    #[serde(rename = "agent.profile.delete")]
+    AgentProfileDelete(AgentProfileDeleteParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.broadcast")]

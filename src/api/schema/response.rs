@@ -119,6 +119,9 @@ pub enum ResponseResult {
     AgentProfileList {
         profiles: Vec<AgentProfileInfo>,
     },
+    AgentProfileDeleted {
+        role: String,
+    },
     AgentPrompted {
         agent: AgentInfo,
     },

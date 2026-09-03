@@ -257,6 +257,17 @@ fn agent_start_and_prompt_requests_round_trip() {
         serde_json::from_value::<Request>(serde_json::to_value(&profile_get).unwrap()).unwrap(),
         profile_get
     );
+
+    let profile_delete = Request {
+        id: "profile-delete".into(),
+        method: Method::AgentProfileDelete(AgentProfileDeleteParams {
+            role: "reviewer".into(),
+        }),
+    };
+    assert_eq!(
+        serde_json::from_value::<Request>(serde_json::to_value(&profile_delete).unwrap()).unwrap(),
+        profile_delete
+    );
 }
 
 #[test]
@@ -288,6 +299,7 @@ fn agent_spawn_schema_publishes_runtime_constraints() {
         protocol_schema_entry::<AgentProfileSetParams>("agent_profile_set"),
         protocol_schema_entry::<AgentProfileSetMdParams>("agent_profile_set_md"),
         protocol_schema_entry::<AgentProfileCreateParams>("agent_profile_create"),
+        protocol_schema_entry::<AgentProfileDeleteParams>("agent_profile_delete"),
     ] {
         assert_eq!(
             params["properties"]["role"]["pattern"],

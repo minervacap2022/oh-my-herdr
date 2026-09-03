@@ -1135,6 +1135,9 @@ impl App {
             Method::AgentProfileSet(params) => {
                 return self.handle_agent_profile_set(request.id, params)
             }
+            Method::AgentProfileDelete(params) => {
+                return self.handle_agent_profile_delete(request.id, params)
+            }
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentBroadcast(params) => {
                 return self.handle_agent_broadcast(request.id, params)

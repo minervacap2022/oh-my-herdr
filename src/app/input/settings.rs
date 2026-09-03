@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::{
@@ -23,6 +23,7 @@ pub(super) enum SettingsAction {
     OpenAgentCreate(String),
     OpenAgentEdit(String),
     SaveAgentProfile,
+    DeleteAgentProfile(String),
     StartAgentProfile(String),
 }
 
@@ -46,6 +47,7 @@ impl App {
                 }
                 SettingsAction::OpenAgentEdit(role) => self.open_agent_profile_edit_form(role),
                 SettingsAction::SaveAgentProfile => self.save_agent_profile_form(),
+                SettingsAction::DeleteAgentProfile(role) => self.delete_agent_profile_via_api(role),
                 SettingsAction::StartAgentProfile(role) => self.spawn_agent_profile_via_api(role),
             }
         }
@@ -69,7 +71,15 @@ impl App {
             role: String::new(),
             harness,
             native_cwd,
+            model: String::new(),
+            effort: String::new(),
+            apikey_ref: String::new(),
+            allowlist: String::new(),
+            additional_markdown: Vec::new(),
+            instructions_path: None,
             instructions: "# Agent instructions".to_string(),
+            instructions_cursor: "# Agent instructions".len(),
+            instructions_scroll: 0,
             selected_field: 0,
         });
     }
@@ -82,12 +92,54 @@ impl App {
     pub(super) fn open_agent_profile_edit_form(&mut self, role: String) {
         match self.profile(&role) {
             Ok(profile) => {
+                let instructions =
+                    match crate::agent_registry::read_owned_instructions(&profile.role) {
+                        Ok(instructions) => instructions,
+                        Err(err) => {
+                            self.show_agent_profile_feedback(
+                                crate::app::state::ToastKind::NeedsAttention,
+                                "agent profile failed",
+                                format!("could not read this profile's AGENTS.md: {err}"),
+                            );
+                            return;
+                        }
+                    };
+                let additional_markdown = profile
+                    .mds
+                    .iter()
+                    .filter(|md| md.name != "AGENTS.md")
+                    .map(|md| format!("{} ({})", md.name, md.path))
+                    .collect();
                 self.state.settings.agent_profile_form = Some(AgentProfileForm {
                     existing_role: Some(profile.role.clone()),
                     role: profile.role,
                     harness: profile.harness,
                     native_cwd: profile.native_cwd,
-                    instructions: String::new(),
+                    model: profile.model.unwrap_or_default(),
+                    effort: profile
+                        .effort
+                        .map(|effort| match effort {
+                            crate::api::schema::AgentProfileEffort::Low => "low",
+                            crate::api::schema::AgentProfileEffort::Medium => "medium",
+                            crate::api::schema::AgentProfileEffort::High => "high",
+                        })
+                        .unwrap_or_default()
+                        .to_string(),
+                    apikey_ref: profile.apikey_ref.unwrap_or_default(),
+                    allowlist: profile
+                        .allowlist
+                        .as_ref()
+                        .and_then(|allowlist| serde_json::to_string(allowlist).ok())
+                        .unwrap_or_default(),
+                    additional_markdown,
+                    instructions_path: Some(
+                        crate::agent_registry::owned_instructions_path(&role)
+                            .display()
+                            .to_string(),
+                    ),
+                    instructions_cursor: instructions.len(),
+                    instructions_scroll: 0,
+                    instructions,
                     selected_field: 0,
                 });
             }
@@ -104,19 +156,7 @@ impl App {
             return;
         };
         let result = match form.existing_role.clone() {
-            Some(role) => self.set_profile(AgentProfileSetParams {
-                role,
-                harness: Some(form.harness.clone()),
-                native_cwd: Some(form.native_cwd.clone()),
-                model: None,
-                effort: None,
-                apikey_ref: None,
-                allowlist: None,
-                clear_model: false,
-                clear_effort: false,
-                clear_apikey_ref: false,
-                clear_allowlist: false,
-            }),
+            Some(role) => save_existing_agent_profile(self, &form, role),
             None => self.create_profile(AgentProfileCreateParams {
                 role: form.role.clone(),
                 harness: form.harness.clone(),
@@ -166,6 +206,34 @@ impl App {
             target: None,
         });
         self.sync_toast_deadline(previous_toast);
+    }
+
+    pub(super) fn delete_agent_profile_via_api(&mut self, role: String) {
+        let response = self.dispatch_runtime_mutation(
+            "tui.agent.profile.delete",
+            crate::api::schema::Method::AgentProfileDelete(
+                crate::api::schema::AgentProfileDeleteParams { role: role.clone() },
+            ),
+        );
+        if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response) {
+            self.show_agent_profile_feedback(
+                crate::app::state::ToastKind::NeedsAttention,
+                "agent profile failed",
+                error.error.message,
+            );
+            return;
+        }
+        self.state.settings.list.selected = self
+            .state
+            .settings
+            .list
+            .selected
+            .min(2 + self.state.saved_agent_profiles.len());
+        self.show_agent_profile_feedback(
+            crate::app::state::ToastKind::Finished,
+            "agent profile deleted",
+            role,
+        );
     }
 }
 
@@ -439,6 +507,14 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                     }
                 }
             }
+            KeyCode::Char('d') => {
+                let selected = state.settings.list.selected;
+                if selected >= 3 {
+                    if let Some(profile) = state.saved_agent_profiles.get(selected - 3) {
+                        return Some(SettingsAction::DeleteAgentProfile(profile.role.clone()));
+                    }
+                }
+            }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 state.settings.section = SettingsSection::PaneLabels;
                 state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
@@ -487,16 +563,42 @@ fn update_agent_profile_form(state: &mut AppState, key: KeyEvent) -> Option<Sett
         KeyCode::Down | KeyCode::Tab => {
             form.selected_field = (form.selected_field + 1).min(form.field_count() - 1);
         }
-        KeyCode::Left => cycle_agent_profile_harness(form, false),
-        KeyCode::Right => cycle_agent_profile_harness(form, true),
+        KeyCode::Left => move_agent_profile_instruction_cursor(form, false),
+        KeyCode::Right => move_agent_profile_instruction_cursor(form, true),
         KeyCode::Backspace => {
-            if let Some(value) = agent_profile_form_field_mut(form) {
+            if form.instructions_selected() {
+                delete_agent_profile_instruction_char(form, true);
+            } else if let Some(value) = agent_profile_form_field_mut(form) {
                 value.pop();
             }
         }
+        KeyCode::Delete if form.instructions_selected() => {
+            delete_agent_profile_instruction_char(form, false);
+        }
+        KeyCode::PageUp if form.instructions_selected() => {
+            form.instructions_scroll = form.instructions_scroll.saturating_sub(8);
+        }
+        KeyCode::PageDown if form.instructions_selected() => {
+            form.instructions_scroll = form.instructions_scroll.saturating_add(8);
+        }
+        KeyCode::Home if form.instructions_selected() => {
+            form.instructions_cursor =
+                instruction_line_start(&form.instructions, form.instructions_cursor);
+        }
+        KeyCode::End if form.instructions_selected() => {
+            form.instructions_cursor =
+                instruction_line_end(&form.instructions, form.instructions_cursor);
+        }
+        KeyCode::Enter
+            if form.instructions_selected() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            insert_agent_profile_instructions(form, "\n");
+        }
         KeyCode::Enter => return Some(SettingsAction::SaveAgentProfile),
         KeyCode::Char(ch) if !ch.is_control() => {
-            if let Some(value) = agent_profile_form_field_mut(form) {
+            if form.instructions_selected() {
+                insert_agent_profile_instructions(form, &ch.to_string());
+            } else if let Some(value) = agent_profile_form_field_mut(form) {
                 value.push(ch);
             }
         }
@@ -509,38 +611,169 @@ fn agent_profile_form_field_mut(form: &mut AgentProfileForm) -> Option<&mut Stri
     match (form.is_new(), form.selected_field) {
         (true, 0) => Some(&mut form.role),
         (true, 2) | (false, 1) => Some(&mut form.native_cwd),
-        (true, 3) => Some(&mut form.instructions),
+        (false, 2) => Some(&mut form.model),
+        (false, 4) => Some(&mut form.apikey_ref),
+        (false, 5) => Some(&mut form.allowlist),
         _ => None,
     }
 }
 
-fn cycle_agent_profile_harness(form: &mut AgentProfileForm, forward: bool) {
-    let harness_field = if form.is_new() { 1 } else { 0 };
-    if form.selected_field != harness_field {
+fn move_agent_profile_instruction_cursor(form: &mut AgentProfileForm, forward: bool) {
+    if form.instructions_selected() {
+        let cursor = form.instructions_cursor.min(form.instructions.len());
+        form.instructions_cursor = if forward {
+            next_instruction_boundary(&form.instructions, cursor)
+        } else {
+            previous_instruction_boundary(&form.instructions, cursor)
+        };
         return;
     }
-    const HARNESSES: [&str; 3] = ["codex", "pi", "claude"];
-    let current = HARNESSES
-        .iter()
-        .position(|harness| *harness == form.harness)
-        .unwrap_or(0);
-    let next = if forward {
-        (current + 1) % HARNESSES.len()
-    } else {
-        (current + HARNESSES.len() - 1) % HARNESSES.len()
-    };
-    form.harness = HARNESSES[next].to_string();
+
+    let harness_field = if form.is_new() { 1 } else { 0 };
+    if form.selected_field == harness_field {
+        const HARNESSES: [&str; 3] = ["codex", "pi", "claude"];
+        let current = HARNESSES
+            .iter()
+            .position(|harness| *harness == form.harness)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % HARNESSES.len()
+        } else {
+            (current + HARNESSES.len() - 1) % HARNESSES.len()
+        };
+        form.harness = HARNESSES[next].to_string();
+        return;
+    }
+
+    if !form.is_new() && form.selected_field == 3 {
+        const EFFORTS: [&str; 4] = ["", "low", "medium", "high"];
+        let current = EFFORTS
+            .iter()
+            .position(|effort| *effort == form.effort)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % EFFORTS.len()
+        } else {
+            (current + EFFORTS.len() - 1) % EFFORTS.len()
+        };
+        form.effort = EFFORTS[next].to_string();
+    }
 }
 
 pub(super) fn insert_agent_profile_form_text(state: &mut AppState, text: &str) -> bool {
     let Some(form) = state.settings.agent_profile_form.as_mut() else {
         return false;
     };
+    if form.instructions_selected() {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text: String = text
+            .chars()
+            .filter(|ch| *ch == '\n' || !ch.is_control())
+            .collect();
+        insert_agent_profile_instructions(form, &text);
+        return true;
+    }
     let Some(value) = agent_profile_form_field_mut(form) else {
         return false;
     };
     value.extend(text.chars().filter(|ch| !ch.is_control()));
     true
+}
+
+fn insert_agent_profile_instructions(form: &mut AgentProfileForm, text: &str) {
+    let cursor = form.instructions_cursor.min(form.instructions.len());
+    form.instructions.insert_str(cursor, text);
+    form.instructions_cursor = cursor + text.len();
+}
+
+fn previous_instruction_boundary(value: &str, cursor: usize) -> usize {
+    value[..cursor.min(value.len())]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_instruction_boundary(value: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(value.len());
+    value[cursor..]
+        .char_indices()
+        .nth(1)
+        .map(|(index, _)| cursor + index)
+        .unwrap_or(value.len())
+}
+
+fn instruction_line_start(value: &str, cursor: usize) -> usize {
+    value[..cursor.min(value.len())]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn instruction_line_end(value: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(value.len());
+    value[cursor..]
+        .find('\n')
+        .map(|index| cursor + index)
+        .unwrap_or(value.len())
+}
+
+fn delete_agent_profile_instruction_char(form: &mut AgentProfileForm, backwards: bool) {
+    let cursor = form.instructions_cursor.min(form.instructions.len());
+    let (start, end) = if backwards {
+        (
+            previous_instruction_boundary(&form.instructions, cursor),
+            cursor,
+        )
+    } else {
+        (
+            cursor,
+            next_instruction_boundary(&form.instructions, cursor),
+        )
+    };
+    if start == end {
+        return;
+    }
+    form.instructions.replace_range(start..end, "");
+    form.instructions_cursor = start;
+}
+
+fn save_existing_agent_profile(
+    app: &mut App,
+    form: &AgentProfileForm,
+    role: String,
+) -> Result<crate::api::schema::AgentProfileInfo, crate::app::agents::AgentProfileError> {
+    let allowlist = if form.allowlist.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&form.allowlist)
+                .map_err(|_| crate::app::agents::AgentProfileError::InvalidAllowlist)?,
+        )
+    };
+    let effort = match form.effort.as_str() {
+        "" => None,
+        "low" => Some(crate::api::schema::AgentProfileEffort::Low),
+        "medium" => Some(crate::api::schema::AgentProfileEffort::Medium),
+        "high" => Some(crate::api::schema::AgentProfileEffort::High),
+        _ => return Err(crate::app::agents::AgentProfileError::InvalidPatch),
+    };
+    let profile = app.set_profile(AgentProfileSetParams {
+        role: role.clone(),
+        harness: Some(form.harness.clone()),
+        native_cwd: Some(form.native_cwd.clone()),
+        model: (!form.model.trim().is_empty()).then(|| form.model.clone()),
+        effort,
+        apikey_ref: (!form.apikey_ref.trim().is_empty()).then(|| form.apikey_ref.clone()),
+        allowlist,
+        clear_model: form.model.trim().is_empty(),
+        clear_effort: form.effort.is_empty(),
+        clear_apikey_ref: form.apikey_ref.trim().is_empty(),
+        clear_allowlist: form.allowlist.trim().is_empty(),
+    })?;
+    crate::agent_registry::replace_owned_instructions(&role, &form.instructions)
+        .map_err(|err| crate::app::agents::AgentProfileError::PersistFailed(err.to_string()))?;
+    Ok(profile)
 }
 
 pub(crate) fn open_settings(state: &mut AppState) {
@@ -756,13 +989,19 @@ impl AppState {
     fn agent_profile_form_field_at(&self, row: u16) -> Option<usize> {
         let form = self.settings.agent_profile_form.as_ref()?;
         let area = self.settings_content_rect();
-        let first_field_y = if form.is_new() {
-            area.y + 3
+        let (first_field_y, text_field_count, document_y) = if form.is_new() {
+            (area.y + 3, 3, area.y + 6)
         } else {
-            area.y + 4
+            (area.y + 4, 6, area.y + 11)
         };
         let offset = row.checked_sub(first_field_y)? as usize;
-        (offset < form.field_count()).then_some(offset)
+        if offset < text_field_count {
+            Some(offset)
+        } else if row >= document_y && row < area.y.saturating_add(area.height) {
+            Some(form.instructions_field())
+        } else {
+            None
+        }
     }
 }
 
@@ -867,6 +1106,13 @@ mod tests {
             ),
             Some(SettingsAction::OpenAgentEdit("reviewer".to_string()))
         );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::DeleteAgentProfile("reviewer".to_string()))
+        );
     }
 
     #[test]
@@ -878,7 +1124,15 @@ mod tests {
             role: String::new(),
             harness: "codex".to_string(),
             native_cwd: "/tmp".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            apikey_ref: String::new(),
+            allowlist: String::new(),
+            additional_markdown: Vec::new(),
+            instructions_path: None,
             instructions: String::new(),
+            instructions_cursor: 0,
+            instructions_scroll: 0,
             selected_field: 0,
         });
 
@@ -912,6 +1166,53 @@ mod tests {
             update_settings_state(
                 &mut state,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::SaveAgentProfile)
+        );
+    }
+
+    #[test]
+    fn agent_profile_instructions_keep_lines_from_typing_and_paste() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Agents);
+        state.settings.agent_profile_form = Some(AgentProfileForm {
+            existing_role: None,
+            role: "reviewer".to_string(),
+            harness: "codex".to_string(),
+            native_cwd: "/tmp".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            apikey_ref: String::new(),
+            allowlist: String::new(),
+            additional_markdown: Vec::new(),
+            instructions_path: None,
+            instructions: "first line".to_string(),
+            instructions_cursor: "first line".len(),
+            instructions_scroll: 0,
+            selected_field: 3,
+        });
+
+        assert!(insert_agent_profile_form_text(
+            &mut state,
+            "\r\nsecond line\nthird line"
+        ));
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            state
+                .settings
+                .agent_profile_form
+                .as_ref()
+                .unwrap()
+                .instructions,
+            "first line\nsecond line\nthird line\n"
+        );
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             ),
             Some(SettingsAction::SaveAgentProfile)
         );

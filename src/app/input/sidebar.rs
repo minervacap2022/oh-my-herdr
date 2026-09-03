@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_saved_profile_opens_a_cwd_choice_for_the_active_space() {
+    fn clicking_saved_profile_opens_its_spawn_and_management_menu() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("project")];
         app.state.active = Some(0);
@@ -643,8 +643,16 @@ mod tests {
         ));
 
         assert_eq!(app.state.mode, Mode::ContextMenu);
-        let menu = app.state.context_menu.as_ref().expect("profile spawn menu");
-        assert_eq!(menu.items(), vec!["Use space cwd", "Use agent native cwd"]);
+        let menu = app.state.context_menu.as_ref().expect("profile menu");
+        assert_eq!(
+            menu.items(),
+            vec![
+                "Use space cwd",
+                "Use agent native cwd",
+                "Edit profile",
+                "Delete profile",
+            ]
+        );
         assert!(matches!(
             menu.kind,
             crate::app::state::ContextMenuKind::AgentProfileSpawn { ref role, ws_idx: 0 }

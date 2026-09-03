@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph, Tabs},
+    widgets::{List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -22,7 +22,7 @@ pub(crate) fn settings_popup_height(app: &AppState) -> u16 {
     match app.settings.section {
         crate::app::state::SettingsSection::Agents => {
             let rows = if app.settings.agent_profile_form.is_some() {
-                7
+                20
             } else {
                 3 + app.saved_agent_profiles.len() as u16
             };
@@ -208,8 +208,15 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
                 .add_modifier(Modifier::BOLD),
         );
 
-        let footer_hint = if app.settings.agent_profile_form.is_some() {
-            " ↑↓ select field  ←→ harness  ↵ save"
+        let footer_hint = if app
+            .settings
+            .agent_profile_form
+            .as_ref()
+            .is_some_and(crate::app::state::AgentProfileForm::instructions_selected)
+        {
+            " tab selects field  ↵ adds line  ctrl+↵ saves  pgup/pgdn views"
+        } else if app.settings.agent_profile_form.is_some() {
+            " ↑↓ selects field  ←→ cycles choices  ↵ saves"
         } else {
             " ↑↓ select  tab section"
         };
@@ -409,7 +416,7 @@ fn render_settings_agents(app: &AppState, frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "enter starts a saved profile • e edits its harness and working directory",
+            "enter starts • e edits • d deletes a saved profile",
             Style::default().fg(p.overlay1),
         ))),
         rows[1],
@@ -434,7 +441,7 @@ fn render_settings_agents(app: &AppState, frame: &mut Frame, area: Rect) {
             Span::styled(" ▶ ", Style::default().fg(p.green)),
             Span::styled(&profile.role, Style::default().fg(p.text)),
             Span::styled(
-                format!("  {}", profile.harness),
+                format!("  {}  {}", profile.harness, profile.native_cwd),
                 Style::default().fg(p.overlay1),
             ),
         ]))
@@ -464,11 +471,11 @@ fn render_agent_profile_form(
         "edit agent profile"
     };
     let description = if form.is_new() {
-        "choose a role, working directory, and initial profile instructions"
+        "choose a role, working directory, and profile-owned AGENTS.md"
     } else {
-        "change the native harness or working directory for this saved agent"
+        "inspect and change the saved native settings and AGENTS.md"
     };
-    let mut lines = vec![
+    let mut details = vec![
         Line::from(Span::styled(
             title,
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
@@ -478,58 +485,117 @@ fn render_agent_profile_form(
     ];
 
     if form.is_new() {
-        lines.push(agent_profile_form_line(
+        details.push(agent_profile_form_line(
             "role",
             &form.role,
             form.selected_field == 0,
             p,
         ));
-        lines.push(agent_profile_form_line(
+        details.push(agent_profile_form_line(
             "native harness",
             &format!("{}  (←→ to change)", form.harness),
             form.selected_field == 1,
             p,
         ));
-        lines.push(agent_profile_form_line(
+        details.push(agent_profile_form_line(
             "native cwd",
             &form.native_cwd,
             form.selected_field == 2,
             p,
         ));
-        lines.push(agent_profile_form_line(
-            "AGENTS.md",
-            &form.instructions,
-            form.selected_field == 3,
-            p,
-        ));
     } else {
-        lines.push(Line::from(vec![
+        details.push(Line::from(vec![
             Span::styled(" role: ", Style::default().fg(p.overlay1)),
             Span::styled(&form.role, Style::default().fg(p.text)),
         ]));
-        lines.push(agent_profile_form_line(
+        details.push(agent_profile_form_line(
             "native harness",
             &format!("{}  (←→ to change)", form.harness),
             form.selected_field == 0,
             p,
         ));
-        lines.push(agent_profile_form_line(
+        details.push(agent_profile_form_line(
             "native cwd",
             &form.native_cwd,
             form.selected_field == 1,
             p,
         ));
-        lines.push(Line::from(Span::styled(
-            " profile-owned AGENTS.md stays attached when these settings change",
+        details.push(agent_profile_form_line(
+            "model",
+            display_agent_profile_value(&form.model, "harness default"),
+            form.selected_field == 2,
+            p,
+        ));
+        details.push(agent_profile_form_line(
+            "effort",
+            display_agent_profile_value(&form.effort, "harness default (←→ to change)"),
+            form.selected_field == 3,
+            p,
+        ));
+        details.push(agent_profile_form_line(
+            "API key ref",
+            display_agent_profile_value(&form.apikey_ref, "not set"),
+            form.selected_field == 4,
+            p,
+        ));
+        details.push(agent_profile_form_line(
+            "tool allowlist",
+            display_agent_profile_value(&form.allowlist, "not set"),
+            form.selected_field == 5,
+            p,
+        ));
+        details.push(Line::from(Span::styled(
+            format!(
+                " extra Markdown: {}",
+                if form.additional_markdown.is_empty() {
+                    "none".to_string()
+                } else {
+                    form.additional_markdown.join(", ")
+                }
+            ),
             Style::default().fg(p.overlay1),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " enter saves • esc cancels",
-        Style::default().fg(p.overlay0),
-    )));
-    frame.render_widget(Paragraph::new(lines), area);
+
+    let details_height = details.len() as u16;
+    let rows = Layout::vertical([
+        Constraint::Length(details_height),
+        Constraint::Length(1),
+        Constraint::Min(4),
+        Constraint::Length(1),
+    ])
+    .areas::<4>(area);
+    frame.render_widget(Paragraph::new(details), rows[0]);
+
+    let document_title = match &form.instructions_path {
+        Some(path) => format!(" AGENTS.md  {path}"),
+        None => " AGENTS.md".to_string(),
+    };
+    let document_style = if form.instructions_selected() {
+        Style::default().fg(p.text).bg(p.surface0)
+    } else {
+        Style::default().fg(p.subtext0)
+    };
+    frame.render_widget(
+        Paragraph::new(document_title).style(document_style),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(form.instructions.clone())
+            .style(document_style)
+            .wrap(Wrap { trim: false })
+            .scroll((form.instructions_scroll.min(u16::MAX as usize) as u16, 0)),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(if form.instructions_selected() {
+            " ←→ moves cursor • home/end line • enter line break • ctrl+enter saves"
+        } else {
+            " enter saves • esc cancels"
+        })
+        .style(Style::default().fg(p.overlay0)),
+        rows[3],
+    );
 }
 
 fn agent_profile_form_line(label: &str, value: &str, selected: bool, p: &Palette) -> Line<'static> {
@@ -542,6 +608,14 @@ fn agent_profile_form_line(label: &str, value: &str, selected: bool, p: &Palette
         Span::styled(format!(" {}: ", label), style),
         Span::styled(value.to_string(), style),
     ])
+}
+
+fn display_agent_profile_value<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
 }
 
 fn render_settings_theme(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -640,7 +714,7 @@ mod tests {
             "create Pi agent",
             "create Claude agent",
             "reviewer",
-            "enter starts a saved profile",
+            "enter starts • e edits • d deletes a saved profile",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -659,7 +733,15 @@ mod tests {
             role: "reviewer".to_string(),
             harness: "pi".to_string(),
             native_cwd: "/workspace".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            apikey_ref: String::new(),
+            allowlist: String::new(),
+            additional_markdown: Vec::new(),
+            instructions_path: None,
             instructions: "review this change".to_string(),
+            instructions_cursor: "review this change".len(),
+            instructions_scroll: 0,
             selected_field: 0,
         });
 
@@ -670,6 +752,47 @@ mod tests {
             "pi",
             "/workspace",
             "AGENTS.md",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_settings_visibly_renders_profile_details_and_multiline_instructions() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Settings;
+        app.settings.section = SettingsSection::Agents;
+        app.settings.agent_profile_form = Some(AgentProfileForm {
+            existing_role: Some("reviewer".to_string()),
+            role: "reviewer".to_string(),
+            harness: "claude".to_string(),
+            native_cwd: "/workspace/reviewer".to_string(),
+            model: "sonnet".to_string(),
+            effort: "high".to_string(),
+            apikey_ref: "env:REVIEWER_API_KEY".to_string(),
+            allowlist: r#"{"tools":["Read"]}"#.to_string(),
+            additional_markdown: vec!["review-guide.md (/workspace/review-guide.md)".to_string()],
+            instructions_path: Some("/state/agent-context/reviewer/AGENTS.md".to_string()),
+            instructions: "# Reviewer\n\nCheck every changed file.".to_string(),
+            instructions_cursor: 0,
+            instructions_scroll: 0,
+            selected_field: 6,
+        });
+
+        let rendered = rendered_text(&app);
+        for expected in [
+            "edit agent profile",
+            "claude",
+            "/workspace/reviewer",
+            "sonnet",
+            "high",
+            "env:REVIEWER_API_KEY",
+            "extra Markdown",
+            "# Reviewer",
+            "Check every changed file.",
         ] {
             assert!(
                 rendered.contains(expected),

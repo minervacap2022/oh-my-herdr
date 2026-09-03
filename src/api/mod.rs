@@ -53,6 +53,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentProfileCreate(_)
             | Method::AgentProfileSetMd(_)
             | Method::AgentProfileSet(_)
+            | Method::AgentProfileDelete(_)
             | Method::AgentPrompt(_)
             | Method::AgentBroadcast(_)
             | Method::AgentSendKeys(_)

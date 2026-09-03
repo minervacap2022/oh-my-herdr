@@ -1269,6 +1269,19 @@
           ],
           "type": "object"
         },
+        "AgentProfileDeleteParams": {
+          "description": "Delete a saved profile. Live panes are not closed by this operation.",
+          "properties": {
+            "role": {
+              "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role"
+          ],
+          "type": "object"
+        },
         "AgentProfileEffort": {
           "enum": [
             "low",
@@ -5454,6 +5467,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.profile.delete",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentProfileDeleteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.prompt",
               "type": "string"
             },
@@ -9585,6 +9614,22 @@
               "required": [
                 "type",
                 "profiles"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "role": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_profile_deleted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "role"
               ],
               "type": "object"
             },

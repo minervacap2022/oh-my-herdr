@@ -914,6 +914,9 @@ pub(super) fn apply_context_menu_action(
         ) => {
             leave_modal(state);
         }
+        (ContextMenuKind::AgentProfileSpawn { .. }, Some("Edit profile" | "Delete profile")) => {
+            leave_modal(state);
+        }
         (
             ContextMenuKind::Pane {
                 ws_idx, pane_id, ..
@@ -1340,6 +1343,18 @@ impl App {
             }
             (ContextMenuKind::AgentProfileSpawn { role, ws_idx }, Some("Use agent native cwd")) => {
                 self.spawn_agent_profile_in_workspace_via_api(role, Some(ws_idx), "agent");
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::AgentProfileSpawn { role, .. }, Some("Edit profile")) => {
+                leave_modal(&mut self.state);
+                crate::app::input::open_settings_at(
+                    &mut self.state,
+                    crate::app::state::SettingsSection::Agents,
+                );
+                self.open_agent_profile_edit_form(role);
+            }
+            (ContextMenuKind::AgentProfileSpawn { role, .. }, Some("Delete profile")) => {
+                self.delete_agent_profile_via_api(role);
                 leave_modal(&mut self.state);
             }
             (

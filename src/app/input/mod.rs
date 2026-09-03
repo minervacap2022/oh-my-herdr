@@ -426,6 +426,9 @@ impl App {
                             self.open_agent_profile_edit_form(role)
                         }
                         SettingsAction::SaveAgentProfile => self.save_agent_profile_form(),
+                        SettingsAction::DeleteAgentProfile(role) => {
+                            self.delete_agent_profile_via_api(role)
+                        }
                         SettingsAction::StartAgentProfile(role) => {
                             self.spawn_agent_profile_via_api(role)
                         }

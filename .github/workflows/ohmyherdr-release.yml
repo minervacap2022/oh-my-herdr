@@ -1,0 +1,101 @@
+name: Release OhMyHerdr
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Product version from Cargo.toml (for example 0.8.3)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  release-macos-arm64:
+    runs-on: macos-latest
+    env:
+      OHMYHERDR_BUILD: "1"
+      HERDR_BUILD_CHANNEL: ohmyherdr
+      HERDR_BUILD_ID: ${{ inputs.version }}
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: "true"
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify product version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          test "$(printf '%s' "$version" | tr -cd '.')" = ".."
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "$version" = "$cargo_version"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-apple-darwin
+
+      - name: Restore Homebrew Zig cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: homebrew-zig-0.15-${{ runner.os }}-${{ runner.arch }}
+          restore-keys: |
+            homebrew-zig-0.15-${{ runner.os }}-
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja zig@0.15
+          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix zig@0.15)/bin/zig" version
+
+      - name: Build product artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+          cargo build --release --locked --target aarch64-apple-darwin
+          cp target/aarch64-apple-darwin/release/herdr ohmyherdr-macos-aarch64
+          chmod +x ohmyherdr-macos-aarch64
+          ./ohmyherdr-macos-aarch64 --version | grep -F "${{ inputs.version }}-ohmyherdr.${{ inputs.version }}"
+
+      - name: Publish release and update manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          tag="ohmyherdr-v${version}"
+          asset="ohmyherdr-macos-aarch64"
+          checksum="$(shasum -a 256 "$asset" | awk '{print $1}')"
+          protocol="$(sed -n 's/pub const PROTOCOL_VERSION: u32 = \([0-9][0-9]*\);/\1/p' src/protocol/wire.rs)"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
+          cat > ohmyherdr-latest.json <<EOF
+          {
+            "version": "${version}",
+            "protocol": ${protocol},
+            "notes": "### Changed\\n- Native agent profiles now own their settings and AGENTS.md documents.\\n- Spaces can select their own working directory when spawning a profile.\\n- The OhMyHerdr updater is isolated from stable Herdr.",
+            "assets": {
+              "macos-aarch64": {
+                "url": "${url}",
+                "sha256": "${checksum}"
+              }
+            }
+          }
+          EOF
+          gh release create "$tag" "$asset" ohmyherdr-latest.json \
+            --target "$GITHUB_SHA" \
+            --title "OhMyHerdr v${version}" \
+            --notes "Production OTA release for Apple Silicon macOS."

@@ -1211,7 +1211,24 @@ pub struct AgentProfileForm {
     pub role: String,
     pub harness: String,
     pub native_cwd: String,
+    /// Empty means the harness default is used.
+    pub model: String,
+    /// Empty means the harness default is used.
+    pub effort: String,
+    /// Empty means no environment-variable reference is configured.
+    pub apikey_ref: String,
+    /// Empty means no tool allowlist is configured. Non-empty values are JSON.
+    pub allowlist: String,
+    /// Other Markdown files injected alongside the profile-owned `AGENTS.md`.
+    pub additional_markdown: Vec<String>,
+    /// The durable path is useful when a user needs to identify this profile's
+    /// owned instructions among project-level instruction files.
+    pub instructions_path: Option<String>,
     pub instructions: String,
+    /// Byte offset at a UTF-8 boundary in `instructions`.
+    pub instructions_cursor: usize,
+    /// First logical instruction line shown in the editor viewport.
+    pub instructions_scroll: usize,
     pub selected_field: usize,
 }
 
@@ -1224,8 +1241,20 @@ impl AgentProfileForm {
         if self.is_new() {
             4
         } else {
-            2
+            7
         }
+    }
+
+    pub fn instructions_field(&self) -> usize {
+        if self.is_new() {
+            3
+        } else {
+            6
+        }
+    }
+
+    pub fn instructions_selected(&self) -> bool {
+        self.selected_field == self.instructions_field()
     }
 }
 
@@ -1380,7 +1409,12 @@ impl ContextMenuState {
                 items
             }
             ContextMenuKind::AgentProfileSpawn { .. } => {
-                vec!["Use space cwd", "Use agent native cwd"]
+                vec![
+                    "Use space cwd",
+                    "Use agent native cwd",
+                    "Edit profile",
+                    "Delete profile",
+                ]
             }
         }
     }

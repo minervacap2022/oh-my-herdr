@@ -27,7 +27,6 @@ const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
@@ -1522,7 +1521,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
     }
 
     let current_version = current_version();
-    let manifest_bytes = fetch_remote_manifest(STABLE_UPDATE_MANIFEST_URL)?;
+    let manifest_bytes = fetch_remote_manifest(crate::update::stable_update_manifest_url())?;
     let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
     let release = manifest.release_for_version(&current_version).ok_or_else(|| {
