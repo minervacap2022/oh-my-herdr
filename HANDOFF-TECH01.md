@@ -488,3 +488,42 @@ product build SHA-256   f6f4516a23aac3142ff8e009730c10a86b48bba2712c54b3bf4ed137
 This change has not stopped, restarted, or modified stable Herdr. The stable
 binary and server values above remain the required guardrails when installing
 or testing this next product OTA.
+
+## 2026-09-04 OTA live-handoff identity repair
+
+The product updater's manifest used the plain release number (for example,
+`0.8.5`) as the expected live-handoff identity. A product binary correctly
+reports its build identity as `0.8.5-ohmyherdr.0.8.5`. The server rejects a
+handoff when those values differ, so the old server safely rolled back after
+installing an update rather than replacing live agent panes.
+
+`src/update.rs` now derives the expected manifest identity from the active
+product build: upstream Herdr continues to use a plain version and OhMyHerdr
+uses `<version>-ohmyherdr.<version>`. The deterministic unit test covers both
+forms.
+
+The isolated named-session E2E proof used the old product `0.8.2` server and
+the new `0.8.5` product binary:
+
+```text
+before handoff  0.8.2-ohmyherdr.beta.20260902
+after handoff   0.8.5-ohmyherdr.0.8.5
+protocol        21
+socket          /Users/tech01/.config/ohmyherdr/sessions/ota-handoff-084/ohmyherdr.sock
+```
+
+The disposable `ota-handoff-084` session was stopped and deleted immediately
+after the proof. The default isolated product server stayed on PID `12425`,
+and stable Herdr stayed on PID `7810` with the required SHA-256
+`37350546b0012555943b92eaf962665de4e264395baeb44227b8015e8ff5b0d6`.
+
+Release-candidate verification:
+
+```text
+cargo fmt --all -- --check
+cargo test --bin herdr -- --test-threads=1
+3411 passed, 0 failed, 1 ignored
+
+product identity  ohmyherdr 0.8.5-ohmyherdr.0.8.5
+product SHA-256   9021f7757e50b477043478e44700ba775759c289673a27d1bf42a29b5b36eed0
+```

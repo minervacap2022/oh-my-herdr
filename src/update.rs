@@ -325,6 +325,14 @@ impl ReleaseInfo {
     }
 }
 
+fn stable_release_identity(version: &Version, is_ohmyherdr: bool) -> String {
+    if is_ohmyherdr {
+        format!("{version}-ohmyherdr.{version}")
+    } else {
+        version.to_string()
+    }
+}
+
 fn fetch_update_manifest() -> Result<UpdateManifest, String> {
     fetch_json_manifest(stable_update_manifest_url())
 }
@@ -426,7 +434,7 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         })?;
 
     Ok(Some(ReleaseInfo {
-        identity: latest.to_string(),
+        identity: stable_release_identity(&latest, crate::build_info::is_ohmyherdr()),
         version: latest,
         channel: UpdateChannel::Stable,
         build_id: None,
@@ -2824,6 +2832,17 @@ mod tests {
         assert_eq!(
             stable_update_manifest_url_for_product(true),
             "https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-latest.json"
+        );
+    }
+
+    #[test]
+    fn product_release_identity_matches_the_imported_product_binary() {
+        let version = Version::parse("9.8.7").unwrap();
+
+        assert_eq!(stable_release_identity(&version, false), "9.8.7");
+        assert_eq!(
+            stable_release_identity(&version, true),
+            "9.8.7-ohmyherdr.9.8.7"
         );
     }
 
