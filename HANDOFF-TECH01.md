@@ -527,3 +527,45 @@ cargo test --bin herdr -- --test-threads=1
 product identity  ohmyherdr 0.8.5-ohmyherdr.0.8.5
 product SHA-256   9021f7757e50b477043478e44700ba775759c289673a27d1bf42a29b5b36eed0
 ```
+
+### Publication and default-product handoff result
+
+OhMyHerdr `0.8.5` is public and its native update manifest and binary were
+downloaded anonymously, checksum-verified, and version-checked:
+
+```text
+release      https://github.com/minervacap2022/oh-my-herdr/releases/tag/ohmyherdr-v0.8.5
+manifest     https://github.com/minervacap2022/oh-my-herdr/releases/latest/download/ohmyherdr-latest.json
+artifact     ohmyherdr-macos-aarch64
+asset SHA    9021f7757e50b477043478e44700ba775759c289673a27d1bf42a29b5b36eed0
+identity     ohmyherdr 0.8.5-ohmyherdr.0.8.5
+commit       1047aeedf9cab82bde34c070713675e8d575231c
+```
+
+The installed `0.8.4` updater safely downloaded and installed `0.8.5` but,
+as expected, its pre-fix client still supplied the old plain identity to the
+old `0.8.2` server. It rolled back the handoff without affecting panes. The
+new installed `0.8.5` client then completed its native `server live-handoff`
+with the corrected identity.
+
+The default product is now live and healthy without a restart:
+
+```text
+product executable /Users/tech01/oh-my-herdr/.local/ohmyherdr/bin/ohmyherdr
+product SHA-256    9021f7757e50b477043478e44700ba775759c289673a27d1bf42a29b5b36eed0
+product PID         12425
+product version     0.8.5-ohmyherdr.0.8.5
+product protocol    21
+product sockets     /Users/tech01/.config/ohmyherdr/ohmyherdr.sock
+                    /Users/tech01/.config/ohmyherdr/ohmyherdr-client.sock
+```
+
+The same product smoke preserved four Spaces and the existing saved profiles
+and live roster entries, including the active `testing` Codex process. Stable
+Herdr remains separately live at PID `7810`, version `0.7.5`, protocol `17`,
+its original sockets under `/Users/tech01/.config/herdr`, and the required
+unchanged SHA-256 `37350546b0012555943b92eaf962665de4e264395baeb44227b8015e8ff5b0d6`.
+
+There is no remaining OTA or product-cutover blocker. New product releases
+will use `ohmyherdr update --handoff` directly: their updater calculates the
+product identity before it requests the server handoff.
