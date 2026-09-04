@@ -553,7 +553,7 @@ The default product is now live and healthy without a restart:
 ```text
 product executable /Users/tech01/oh-my-herdr/.local/ohmyherdr/bin/ohmyherdr
 product SHA-256    9021f7757e50b477043478e44700ba775759c289673a27d1bf42a29b5b36eed0
-product PID         12425
+product PID         2711
 product version     0.8.5-ohmyherdr.0.8.5
 product protocol    21
 product sockets     /Users/tech01/.config/ohmyherdr/ohmyherdr.sock
